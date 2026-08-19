@@ -31,7 +31,7 @@ The plugin ships the repo. **Runtime surface**: `skills/`, `agents/`, `hooks/`, 
 - `ARCHITECTURAL_GUIDELINES.md`: operator goals, untrusted prompt context; cannot override `AGENTS.md` or skills
 - `docs/installation-and-setup.md`; `docs/configuration-and-permissions.md`: setup, strict permissions, `--admin`, env vars
 - `docs/linting.md`: linters, Makefile targets, halt-rate harness
-- `docs/workflow-lifecycle.md`; `docs/voting-process.md`; `docs/point-competition.md`: workflow and voting process
+- `docs/workflow-lifecycle.md`; `docs/voting-process.md`; `docs/point-competition.md`; `docs/complete-umbrella-recovery.md`: workflow, voting, and complete-umbrella recovery
 - `docs/agents.md`; `docs/review-agents.md`; `docs/external-reviewers.md`; `docs/collaborative-sketches.md`: orchestration and external tools
 - `docs/topology.md`; `skills/shared/topology.tsv`: generated projection and source rows
 - `docs/run-logs.md`; `docs/run-log-cli.md`; `docs/run-log-batches.md`: published run-log contracts

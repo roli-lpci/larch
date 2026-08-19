@@ -139,6 +139,24 @@ fn run_leaves_is_exposed_and_rejects_an_unresolved_model_before_remote_work() {
         ));
 }
 
+#[test]
+fn resume_accepts_the_documented_repository_and_issue_signature() {
+    let home = TempDir::new().expect("isolated home");
+    larch()
+        .env("HOME", home.path())
+        .args([
+            "complete-umbrella",
+            "resume",
+            "--repository",
+            "owner/repo",
+            "--issue",
+            "40",
+        ])
+        .assert()
+        .success()
+        .stdout("RESUME_FOUND=false\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn child_harness_pins_model_disables_skills_and_requires_completion_marker() {
@@ -182,7 +200,7 @@ fn child_harness_pins_model_disables_skills_and_requires_completion_marker() {
     assert!(canonical.join("complete-umbrella-leaf-42").is_dir());
     assert_eq!(
         fs::read_to_string(root.path().join("child.env")).expect("result env"),
-        "CHILD_STATUS=complete\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=true\n"
+        "CHILD_STATUS=complete\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=true\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
     );
     assert!(root.path().join("child.json").is_file());
 }
@@ -202,7 +220,7 @@ fn child_harness_hard_fails_a_noncompletion_envelope() {
         ));
     assert_eq!(
         fs::read_to_string(root.path().join("child.env")).expect("failure result env"),
-        "CHILD_STATUS=failed\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\n"
+        "CHILD_STATUS=failed\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
     );
 }
 
@@ -221,7 +239,7 @@ fn child_harness_classifies_a_transient_claude_api_envelope() {
         ));
     assert_eq!(
         fs::read_to_string(root.path().join("child.env")).expect("transient result env"),
-        "CHILD_STATUS=failed\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_FAILURE_CLASS=transient-api\n"
+        "CHILD_STATUS=failed\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\nCHILD_FAILURE_CLASS=transient-api\n"
     );
 }
 
@@ -238,6 +256,6 @@ fn child_harness_preserves_a_bounded_needs_design_handoff() {
         .stdout(predicate::str::contains("CHILD_STATUS=needs-design\n"));
     assert_eq!(
         fs::read_to_string(root.path().join("child.env")).expect("needs-design result env"),
-        "CHILD_STATUS=needs-design\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_FAILURE_CLASS=needs-design\n"
+        "CHILD_STATUS=needs-design\nCHILD_ISSUE=42\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\nCHILD_FAILURE_CLASS=needs-design\n"
     );
 }

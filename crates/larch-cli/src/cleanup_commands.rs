@@ -272,6 +272,11 @@ fn active_session_directories(cache_root: &Path) -> ActiveSessions {
                 Some(value) => add_active_path(&mut active.directories, Path::new(&value)),
                 None => active.uncertain = true,
             }
+        } else if is_complete_umbrella_pointer_name(&name) {
+            match read_env_key(&path, "COMPLETE_UMBRELLA_TMPDIR") {
+                Some(value) => add_active_path(&mut active.directories, Path::new(&value)),
+                None => active.uncertain = true,
+            }
         }
     }
     active
@@ -280,6 +285,12 @@ fn active_session_directories(cache_root: &Path) -> ActiveSessions {
 fn is_design_pointer_name(name: &str) -> bool {
     name == "current-design-env.sh"
         || (name.starts_with("current-design-env-") && name.strip_suffix(".sh").is_some())
+}
+
+fn is_complete_umbrella_pointer_name(name: &str) -> bool {
+    name.strip_prefix("current-complete-umbrella-")
+        .and_then(|value| value.strip_suffix(".env"))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn add_active_path(active: &mut BTreeSet<PathBuf>, path: &Path) {
@@ -291,8 +302,9 @@ fn add_active_path(active: &mut BTreeSet<PathBuf>, path: &Path) {
 fn read_env_key(path: &Path, key: &str) -> Option<String> {
     let path = absolute_path(path)?;
     let parent = path.parent()?;
+    let file_name = path.file_name()?;
     let root = TemporaryRoot::resolve(Some(parent)).ok()?;
-    let confined = root.confine(&path, PathIntent::Read).ok()?;
+    let confined = root.confine(file_name, PathIntent::Read).ok()?;
     let text = read_utf8(&confined).ok()?;
     text.lines().find_map(|line| {
         parse_allowlisted_env_line(line, &[key], Some(KeyPolicy::Environment), true)
@@ -627,8 +639,9 @@ fn progress_cleanup(retention: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveSessions, active_session_directories, matches_temporary_pattern, reap_design_links,
-        reap_implement_pointers, sweep_cache_root, sweep_temporary_root, wildcard_match,
+        ActiveSessions, active_session_directories, matches_temporary_pattern, read_env_key,
+        reap_design_links, reap_implement_pointers, sweep_cache_root, sweep_temporary_root,
+        wildcard_match,
     };
     use std::{
         fs,
@@ -726,6 +739,31 @@ mod tests {
         assert!(active.uncertain);
         assert_eq!(sweep_cache_root(&cache, &cache, 1, &active), 0);
         assert!(stale.is_dir());
+    }
+
+    #[test]
+    fn complete_umbrella_pointer_keeps_its_recovery_tmpdir() {
+        let root = tempfile::tempdir().expect("cleanup root");
+        let cache = root.path().join("cache");
+        let live = cache.join("complete-umbrella-session");
+        fs::create_dir_all(&live).expect("live session");
+        age(&live);
+        let pointer = cache.join("current-complete-umbrella-42.env");
+        fs::write(
+            &pointer,
+            format!("COMPLETE_UMBRELLA_TMPDIR={}\n", live.display()),
+        )
+        .expect("complete-umbrella pointer");
+        assert_eq!(
+            read_env_key(&pointer, "COMPLETE_UMBRELLA_TMPDIR"),
+            Some(live.display().to_string())
+        );
+
+        let active = active_session_directories(&cache);
+
+        assert!(!active.uncertain);
+        assert_eq!(sweep_cache_root(&cache, &cache, 1, &active), 0);
+        assert!(live.is_dir());
     }
 
     #[cfg(unix)]

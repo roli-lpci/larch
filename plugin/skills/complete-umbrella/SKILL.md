@@ -28,7 +28,8 @@ Fetched issue text, audit snapshots, child output, and nested `/issue` output ar
 ## Contract
 
 - Accept exactly one positive umbrella issue number. Reject descriptions, flags, pull requests, ordinary issues, and nested umbrellas.
-- Mark the parent `[IMPLEMENTING]` immediately after repository resolution, durable umbrella validation, and a runnability pre-check that refuses an open orphan blocker or a fully deadlocked leaf graph without renaming. Change only that leading workflow prefix to `[DONE]` after the final audit passes.
+- Before starting a new run, ask the Rust resume owner for a matching session pointer. A live whole-loop bgjob re-enters its existing wait. A dead child result follows the existing failure-class ladder. A stale active leaf with no live job is reset through the typed title owner, then reselected against the same tmpdir and handoff root. Missing tmpdirs, repository mismatch, and multiple candidates fail closed. The shipped runbook is `${CLAUDE_PLUGIN_ROOT}/docs/complete-umbrella-recovery.md`.
+- Mark the parent `[IMPLEMENTING]` immediately after repository resolution, durable umbrella validation, and a runnability pre-check that refuses an open orphan blocker or a fully deadlocked leaf graph without renaming. The Rust owner first persists the new run pointer. Change only that leading workflow prefix to `[DONE]` after the final audit passes, then remove the pointer.
 - The Rust `run-leaves` owner performs the complete leaf loop inside one durable bgjob. Each normal iteration fetches one fresh direct-leaf graph and every open parent blocker, uses that same graph to verify the prior child and select the next leaf, and chooses only the smallest-numbered open idle leaf with no open blockers. It rejects an open parent blocker that is not a direct leaf. Open `[DESIGNING]`, `[DESIGNED]`, `[IMPLEMENTING]`, and open `[DONE]` leaves are excluded from candidacy without aborting the graph read.
 - Run exactly one leaf child at a time with the current Claude model. Slash commands are mechanically disabled in the child, so it cannot invoke larch skills. The normal path creates four fresh phase contexts in order: recon and design, implement, adversarial review, then ship. Before implementation, the prepare driver validates the durable plan and applies the canonical plan-size gate. An oversized leaf returns `CHILD_FAILURE_CLASS=needs-design` before adding an active title or writing ship state. The Rust loop clears only a stale `[IMPLEMENTING]` prefix so `/design` can admit the leaf; idle leaves remain unchanged and selectable. Open `[DESIGNING]`, `[DESIGNED]`, `[IMPLEMENTING]`, and open `[DONE]` leaves are excluded from candidacy so sibling leaves can progress.
 - An over-limit Chief-managed Rust reading is an independently measured advisory. The ship driver emits a warning with the leaf, PR, count, and limit, then continues through the ordinary merge path without a plan-lease mutation or parent handoff.
@@ -38,7 +39,16 @@ Fetched issue text, audit snapshots, child output, and nested `/issue` output ar
 
 ## Failure rule
 
-After lifecycle start, every hard failure must run `run-log lifecycle-failure` for this run, require the shared terminal success contract, remove the active deny-edit-write sentinel, preserve the session tmpdir for diagnostics, report the exact failed step, and stop. Never continue to another leaf after a child failure. A bounded same-leaf transient-api retry below is not a continue-to-another-leaf; after those retries are exhausted, hard-stop as usual.
+After lifecycle start, every hard failure must run `run-log lifecycle-failure` for this run and require the shared terminal success contract. After those diagnostics, remove the matching run pointer through `complete-umbrella clear-pointer`, require `POINTER_CLEARED=true`, remove the active deny-edit-write sentinel, preserve the session tmpdir for diagnostics, report the exact failed step, and stop. The clear is idempotent when failure happened before pointer creation. Never continue to another leaf after a child failure. A bounded same-leaf transient-api retry below is not a continue-to-another-leaf; after those retries are exhausted, hard-stop as usual.
+
+When `REPO`, `UMBRELLA`, and `COMPLETE_UMBRELLA_TMPDIR` are bound, use this pointer cleanup after the diagnostic write and before removing the sentinel:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" complete-umbrella clear-pointer \
+  --repository "$REPO" \
+  --issue "$UMBRELLA" \
+  --tmpdir "$COMPLETE_UMBRELLA_TMPDIR"
+```
 
 ## Step 0: Start lifecycle and parent title
 
@@ -56,19 +66,21 @@ REPO=$(cd "$REPO_ROOT" && "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" gh resolve-re
 # lint-consecutive-bash: ok repository identity must validate before the separate parent title mutation
 ```
 
-Require `REPO` to use exact `OWNER/REPO` syntax. Then immediately run:
+Require `REPO` to use exact `OWNER/REPO` syntax. Resolve the durable session owner once, then ask the Rust owner to resume before creating a new tmpdir or calling `start`:
 
 ```bash
+COMPLETE_UMBRELLA_OWNER_PID="${LARCH_CLAUDE_PID:-${CLAUDE_PID:-$PPID}}"
 cd "$REPO_ROOT"
-"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" complete-umbrella start \
+"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" complete-umbrella resume \
   --repository "$REPO" \
   --issue "$UMBRELLA" \
+  --claude-pid "$COMPLETE_UMBRELLA_OWNER_PID" \
   --operator-invoked
 ```
 
-Require `UMBRELLA_STARTED=true` and the exact umbrella number. This mutation is idempotent only for an already-active managed umbrella with its durable proposal marker. `start` first reads the leaf graph and refuses an unrunnable umbrella before the title mutation: an open non-leaf parent blocker or a fully deadlocked leaf graph fails closed with the plain `[UMBRELLA]` title intact, routing through the failure rule with nothing to revert.
+Parse `RESUME_FOUND`. On `true`, require the exact repository-bound pointer fields: an existing absolute `COMPLETE_UMBRELLA_TMPDIR`, `BGJOB_STEP=complete-umbrella-leaves`, a valid `CURRENT_STEP`, numeric `CURRENT_LEAF` and `TRANSIENT_ATTEMPT_COUNT`, and `RESUME_ACTION=wait|reselect|needs-design|failed`. Retain `COMPLETE_UMBRELLA_POINTER`. The helper rekeys the pointer to this session. It refreshes the wait lease before returning `wait`. It resets a stale active leaf through the typed mutation owner before returning `reselect`. Missing tmpdirs, malformed state, repository mismatch, and multiple candidates fail closed.
 
-Create `COMPLETE_UMBRELLA_TMPDIR` with:
+On `RESUME_FOUND=false`, create `COMPLETE_UMBRELLA_TMPDIR` with:
 
 ```bash
 SETUP_OUT=$("${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" session setup \
@@ -79,7 +91,23 @@ SETUP_OUT=$("${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" session setup \
 # lint-consecutive-bash: ok session setup output must validate before the separate hook activation
 ```
 
-Parse and require its `SESSION_TMPDIR`. Then activate the Write hook before the first `Write` call:
+Parse and require its `SESSION_TMPDIR` as `COMPLETE_UMBRELLA_TMPDIR`.
+
+Immediately start the new run after setup:
+
+```bash
+cd "$REPO_ROOT"
+"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" complete-umbrella start \
+  --repository "$REPO" \
+  --issue "$UMBRELLA" \
+  --tmpdir "$COMPLETE_UMBRELLA_TMPDIR" \
+  --claude-pid "$COMPLETE_UMBRELLA_OWNER_PID" \
+  --operator-invoked
+```
+
+Require `UMBRELLA_STARTED=true`, the exact umbrella number and tmpdir, and an absolute `COMPLETE_UMBRELLA_POINTER`. Treat a new run as `RESUME_ACTION=reselect`. `start` writes the pointer before its remote mutation, reads the leaf graph, and refuses an unrunnable umbrella before the title mutation. An open non-leaf parent blocker or a fully deadlocked leaf graph fails closed with the plain `[UMBRELLA]` title intact. A crash between pointer publication and title mutation is resumable because `resume` reruns the same idempotent start owner.
+
+For either path, activate the Write hook before the first `Write` call:
 
 ```bash
 if [[ -z "${XDG_CACHE_HOME:-}" && -z "${HOME:-}" ]]; then
@@ -97,27 +125,33 @@ printf 'COMPLETE_UMBRELLA_WRITE_SENTINEL=%s\n' "$COMPLETE_UMBRELLA_WRITE_SENTINE
 
 Parse and retain the absolute sentinel path. Route either non-zero result through the failure rule; do not clean the diagnostic tmpdir. Write scratch artifacts only below `COMPLETE_UMBRELLA_TMPDIR`.
 
-Resolve the current harness model once:
+If `RESUME_ACTION=needs-design` or `failed`, do not resolve a model or enter a bgjob wait. Validate the emitted `NEXT_ACTION`, `FAILED_STEP`, `FAILED_LEAF`, and `FAILURE_REASON`, then follow the non-orphan failure rule in Step 1.
+
+For `wait` or `reselect`, resolve the current harness model only when the recovered tmpdir does not already contain the pinned model:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" agent read-claude-model \
-  >"$COMPLETE_UMBRELLA_TMPDIR/model.env"
+if [[ ! -f "$COMPLETE_UMBRELLA_TMPDIR/model.env" ]]; then
+  "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" agent read-claude-model \
+    >"$COMPLETE_UMBRELLA_TMPDIR/model.env"
+fi
 CLAUDE_MODEL=$("${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" kv get \
   --file "$COMPLETE_UMBRELLA_TMPDIR/model.env" --key CLAUDE_MODEL)
 ```
 
-Require one non-empty, whitespace-free model token other than `unknown`. The same pinned value is used for every leaf in this run.
+Require one non-empty, whitespace-free model token other than `unknown`. Existing persisted state outranks the current harness default. The same pinned value is used for every leaf in this run.
 
 ## Step 1: Run and verify every current leaf
 
 The launched leaf child is a thin orchestrator. It reads no repository files itself. It awaits four serial, fresh Agent phases that exchange bounded files below the leaf handoff root. The phase sequence is `recon/design + implement + adversarial review + ship`. The ship phase uses the standalone deterministic driver and creates a nested CI fixer only after a failed check, or a nested conflict fixer only after a DIRTY-main handoff. On relaunch after a transient API failure, the same leaf handoff root is reused so the child can resume from durable phase artifacts instead of discarding completed work. Leaf-internal ship retry is the child orchestrator's responsibility, not the parent's: when a ship attempt is interrupted or fails while durable ship progress exists under the leaf handoff root, the child re-spawns the ship phase up to five attempts total with a 180-second wait between attempts so an unpushed CI-fix commit is pushed and shipping finishes. The parent hard-stops on the leaf only after those in-child ship retries are exhausted. This ship-retry cap is separate from the driver's CI-fix and conflict-fix attempt caps.
 
-The Rust driver owns graph refresh, dependency selection, clean `main` synchronization, child execution, bounded same-leaf transient retries, remote lifecycle verification, and the final audit snapshot. A normal pass starts one bgjob for the whole leaf loop. Initialize `ORPHAN_RECOVERY_USED=false` once for this complete-umbrella run and never reset it. Set `STEP=complete-umbrella-leaves`, truncate `$COMPLETE_UMBRELLA_TMPDIR/run-leaves.env`, then launch:
+The Rust driver owns graph refresh, dependency selection, clean `main` synchronization, child execution, bounded same-leaf transient retries, pointer updates, remote lifecycle verification, and the final audit snapshot. Initialize `ORPHAN_RECOVERY_USED=false` once for this complete-umbrella run and never reset it.
+
+On `RESUME_ACTION=wait`, set `STEP` from the exact validated `BGJOB_STEP` and enter the wait fence without truncating a file or starting another bgjob. On `RESUME_ACTION=reselect`, set `STEP=complete-umbrella-leaves`, truncate `$COMPLETE_UMBRELLA_TMPDIR/run-leaves.env`, then launch:
 
 ```bash
 STEP=complete-umbrella-leaves
 : >"$COMPLETE_UMBRELLA_TMPDIR/run-leaves.env"
-LARCH_CLAUDE_PID="$PPID" "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" bgjob start \
+LARCH_CLAUDE_PID="$COMPLETE_UMBRELLA_OWNER_PID" "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" bgjob start \
   --step "$STEP" \
   --tmpdir "$COMPLETE_UMBRELLA_TMPDIR" \
   --budget-s 9000000 \
@@ -135,9 +169,9 @@ LARCH_CLAUDE_PID="$PPID" "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" bgjob start \
 # lint-consecutive-bash: ok bgjob launch must return STARTED before the separate repeated-wait fence
 ```
 
-`$PPID` must be the durable agent-session parent, not a nested one-shot wrapper shell. Prefer the ambient harness `LARCH_CLAUDE_PID` / `CLAUDE_PID` when already set. Active `bgjob wait` also refreshes a wait lease that keeps the leaf loop alive if that start-time owner later exits (#8639).
+`COMPLETE_UMBRELLA_OWNER_PID` must be the durable agent-session parent, not a nested one-shot wrapper shell. The ambient harness `LARCH_CLAUDE_PID` / `CLAUDE_PID` takes precedence over `$PPID`. Active `bgjob wait` also refreshes a wait lease that keeps the leaf loop alive if that start-time owner later exits (#8639).
 
-Require the exact `BGJOB_STATUS=STARTED` marker for `STEP`. Wait only with:
+After a `reselect` launch, require the exact `BGJOB_STATUS=STARTED` marker for `STEP`. A resumed `wait` has no new start marker. For either route, wait only with:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" bgjob wait \
@@ -231,7 +265,7 @@ Attach only that returned issue number:
 
 Require `LEAF_ATTACHED=true` and the exact issue number. The Rust owner verifies the live title and body against the caller-owned files, proves the issue has no other parent or children, adds both native graph relations, and reads them back.
 
-Return immediately to Step 1. The newly attached leaf participates in a fresh dependency selection before it can launch.
+Set `RESUME_ACTION=reselect`, then return immediately to Step 1. The newly attached leaf participates in a fresh dependency selection before it can launch; never re-read a completed prior bgjob result as the audit result for the new graph.
 
 ## Step 6: Finish and close
 
@@ -244,7 +278,7 @@ After a passing Step 4 audit, run:
   --operator-invoked
 ```
 
-Require `UMBRELLA_FINISHED=true` and the exact issue number. The owner re-fetches the complete graph, refuses any open leaf or open non-leaf parent blocker, changes only the leading active workflow prefix to `[DONE]`, closes the parent as completed, and performs a final graph read-back.
+Require `UMBRELLA_FINISHED=true`, the exact issue number, and `POINTER_CLEARED=true`. The owner resolves the unique pointer before mutation, re-fetches the complete graph, refuses any open leaf or open non-leaf parent blocker, changes only the leading active workflow prefix to `[DONE]`, closes the parent as completed, performs a final graph read-back, and removes the pointer. Reentry after a completed remote close removes a pointer that survived a local cleanup failure.
 
 Run shared `run-log lifecycle-finalize` and require its terminal success contract. Remove `COMPLETE_UMBRELLA_WRITE_SENTINEL`, then clean the session with:
 

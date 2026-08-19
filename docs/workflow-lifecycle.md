@@ -192,7 +192,10 @@ callers enter through the verified bootstrap.
 leaf set. Its Rust owner refreshes the graph once per normal iteration, verifies
 the prior child and selects the next leaf from that same snapshot, synchronizes
 clean `main`, and stops on the first bounded failure envelope. Prompt-side
-orchestration resumes only when the driver reaches the final audit state.
+orchestration resumes only when the driver reaches the final audit state. A
+session-keyed pointer survives the invoking model session. Repeating the same
+command rebinds a live wait lease or resets and reselects a stale active leaf
+against the original tmpdir. See [Complete Umbrella Recovery](complete-umbrella-recovery.md).
 
 For every `/complete-umbrella` leaf, recon/design preserves an existing valid
 issue-anchored plan or writes one when absent. Before the prepare driver can

@@ -12,11 +12,14 @@ use crate::{
 use clap::{Args, Subcommand};
 use larch_adapters::{
     FetchRequest, GitRef, GitRefspec, GitRemote, GixRepository, PathIntent, RebaseRequest,
-    TemporaryRoot, TokioProcessRunner,
+    SystemProcessIdentityHost, TemporaryRoot, TokioProcessRunner, assert_no_symlink_ancestors,
+    bgjob_recovery::{BgjobRecoveryOutcome, read_completed_result, recover_abandoned_entry},
+    create_directories,
     github::{
         DependencyEdge, IssueMutationOwner, LiveMutationRequest, SubIssueEdge,
         check_live_mutation_auth,
     },
+    lock_session_activity,
     runtime::{Cancellation, LarchRuntime},
 };
 use larch_core::{
@@ -27,23 +30,24 @@ use larch_core::{
     GitHubIssueState, GitHubRepositoryRef, GitHubService, Head, IMPLEMENTING_PREFIX,
     IssueMutationField, IssueMutationRequest, KvDocument, ParseOptions, ProcessRequest,
     RepositoryRead, StatusOptions, VendorLaunchRequest, VendorProgram, build_claude_argv,
-    complete_umbrella_child_prompt, complete_umbrella_done_title,
+    checked_dir, child_liveness, complete_umbrella_child_prompt, complete_umbrella_done_title,
     complete_umbrella_leaf_non_candidate, complete_umbrella_relaunch_title,
-    complete_umbrella_start_title, emit_kv, has_umbrella_proposal, is_controlling_umbrella_title,
-    is_transient_claude_api_error, parse_claude_envelope, redact, redact_issue_mutation_request,
-    select_complete_umbrella_leaf, single_line, umbrella_leaf_opening, umbrella_leaf_prefix,
-    validate_complete_umbrella_leaf, validate_complete_umbrella_parent,
+    complete_umbrella_start_title, daemon_liveness, emit_kv, has_umbrella_proposal,
+    is_controlling_umbrella_title, is_transient_claude_api_error, is_valid_claude_pid,
+    iter_entries, parse_claude_envelope, private_atomic_write, read_confined_regular_tail, redact,
+    redact_issue_mutation_request, refresh_wait_lease_for_pid, result_env_path,
+    select_complete_umbrella_leaf, session_pointer_root, single_line, umbrella_leaf_opening,
+    umbrella_leaf_prefix, validate_complete_umbrella_leaf, validate_complete_umbrella_parent,
 };
 use serde::Serialize;
-#[cfg(test)]
-use std::fs;
 use std::{
     collections::BTreeSet,
     env,
     ffi::OsString,
     fmt::Write as _,
+    fs,
     num::NonZeroUsize,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
@@ -54,6 +58,493 @@ const CHILD_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const CHILD_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_TRANSIENT_CHILD_RETRIES: u8 = 2;
 const RUN_LEAVES_STEP: &str = "complete-umbrella-leaves";
+const RUN_POINTER_PREFIX: &str = "current-complete-umbrella-";
+const RUN_POINTER_SUFFIX: &str = ".env";
+const RUN_POINTER_VERSION: &str = "1";
+const RUN_POINTER_MAX_BYTES: u64 = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunPointerStep {
+    Start,
+    Select,
+    Launch,
+    Verify,
+    Audit,
+    Failed,
+}
+
+impl RunPointerStep {
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Select => "select",
+            Self::Launch => "launch",
+            Self::Verify => "verify",
+            Self::Audit => "audit",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "start" => Ok(Self::Start),
+            "select" => Ok(Self::Select),
+            "launch" => Ok(Self::Launch),
+            "verify" => Ok(Self::Verify),
+            "audit" => Ok(Self::Audit),
+            "failed" => Ok(Self::Failed),
+            _ => Err("run pointer has an invalid current step".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompleteUmbrellaRunPointer {
+    repository: String,
+    umbrella: u64,
+    tmpdir: PathBuf,
+    current_leaf: Option<u64>,
+    current_step: RunPointerStep,
+    transient_attempt_count: u8,
+    bgjob_step: String,
+    session_pid: u32,
+}
+
+impl CompleteUmbrellaRunPointer {
+    const KEYS: &'static [&'static str] = &[
+        "BGJOB_STEP",
+        "COMPLETE_UMBRELLA_TMPDIR",
+        "CURRENT_LEAF",
+        "CURRENT_STEP",
+        "REPOSITORY",
+        "RUN_POINTER_VERSION",
+        "SESSION_PID",
+        "TRANSIENT_ATTEMPT_COUNT",
+        "UMBRELLA_ISSUE",
+    ];
+
+    fn initial(repository: String, umbrella: u64, tmpdir: PathBuf, session_pid: u32) -> Self {
+        Self {
+            repository,
+            umbrella,
+            tmpdir,
+            current_leaf: None,
+            current_step: RunPointerStep::Start,
+            transient_attempt_count: 0,
+            bgjob_step: RUN_LEAVES_STEP.to_owned(),
+            session_pid,
+        }
+    }
+
+    fn render(&self) -> Result<String, String> {
+        self.validate_consistency()?;
+        let tmpdir = self
+            .tmpdir
+            .to_str()
+            .ok_or("run pointer tmpdir must be valid UTF-8")?;
+        let current_leaf = self.current_leaf.map_or(0, |leaf| leaf).to_string();
+        let umbrella = self.umbrella.to_string();
+        let transient_attempt_count = self.transient_attempt_count.to_string();
+        let session_pid = self.session_pid.to_string();
+        let mut environment = EnvFile::empty();
+        environment
+            .apply_guarded(
+                &[
+                    ("RUN_POINTER_VERSION", RUN_POINTER_VERSION),
+                    ("REPOSITORY", &self.repository),
+                    ("UMBRELLA_ISSUE", &umbrella),
+                    ("COMPLETE_UMBRELLA_TMPDIR", tmpdir),
+                    ("CURRENT_LEAF", &current_leaf),
+                    ("CURRENT_STEP", self.current_step.value()),
+                    ("TRANSIENT_ATTEMPT_COUNT", &transient_attempt_count),
+                    ("BGJOB_STEP", &self.bgjob_step),
+                    ("SESSION_PID", &session_pid),
+                ],
+                Self::KEYS,
+            )
+            .map_err(|error| error.to_string())?;
+        environment.render().map_err(|error| error.to_string())
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let environment =
+            EnvFile::parse(text).map_err(|error| format!("run pointer is malformed: {error}"))?;
+        let values = environment.values();
+        if values.len() != Self::KEYS.len()
+            || values.keys().any(|key| !Self::KEYS.contains(&key.as_str()))
+        {
+            return Err("run pointer has an unexpected key set".to_owned());
+        }
+        let value = |key: &str| {
+            values
+                .get(key)
+                .map(String::as_str)
+                .ok_or_else(|| format!("run pointer is missing {key}"))
+        };
+        if value("RUN_POINTER_VERSION")? != RUN_POINTER_VERSION {
+            return Err("run pointer has an unsupported version".to_owned());
+        }
+        let repository = value("REPOSITORY")?.to_owned();
+        let parsed_repository = parse_repository(&repository)?;
+        if repository != format!("{}/{}", parsed_repository.owner(), parsed_repository.name()) {
+            return Err("run pointer repository is not canonical".to_owned());
+        }
+        let umbrella = parse_positive_u64(value("UMBRELLA_ISSUE")?, "run pointer umbrella")?;
+        let tmpdir = PathBuf::from(value("COMPLETE_UMBRELLA_TMPDIR")?);
+        validate_pointer_tmpdir(&tmpdir)?;
+        let current_leaf = match value("CURRENT_LEAF")? {
+            "0" => None,
+            raw => Some(parse_positive_u64(raw, "run pointer current leaf")?),
+        };
+        let current_step = RunPointerStep::parse(value("CURRENT_STEP")?)?;
+        let transient_attempt_count = value("TRANSIENT_ATTEMPT_COUNT")?
+            .parse::<u8>()
+            .map_err(|_| "run pointer has an invalid transient-attempt count".to_owned())?;
+        if transient_attempt_count > MAX_TRANSIENT_CHILD_RETRIES {
+            return Err("run pointer transient-attempt count exceeds the retry cap".to_owned());
+        }
+        let bgjob_step = value("BGJOB_STEP")?.to_owned();
+        if bgjob_step != RUN_LEAVES_STEP {
+            return Err("run pointer has an unexpected bgjob step".to_owned());
+        }
+        let session_pid_raw = value("SESSION_PID")?;
+        if !is_valid_claude_pid(session_pid_raw) {
+            return Err("run pointer has an invalid session pid".to_owned());
+        }
+        let session_pid = session_pid_raw
+            .parse::<u32>()
+            .map_err(|_| "run pointer has an invalid session pid".to_owned())?;
+        let pointer = Self {
+            repository,
+            umbrella,
+            tmpdir,
+            current_leaf,
+            current_step,
+            transient_attempt_count,
+            bgjob_step,
+            session_pid,
+        };
+        pointer.validate_consistency()?;
+        Ok(pointer)
+    }
+
+    fn validate_consistency(&self) -> Result<(), String> {
+        let invalid = match self.current_step {
+            RunPointerStep::Start | RunPointerStep::Audit => {
+                self.current_leaf.is_some() || self.transient_attempt_count != 0
+            }
+            RunPointerStep::Select => {
+                self.current_leaf.is_none() && self.transient_attempt_count != 0
+            }
+            RunPointerStep::Launch | RunPointerStep::Verify => self.current_leaf.is_none(),
+            RunPointerStep::Failed => false,
+        };
+        if invalid {
+            Err("run pointer has an inconsistent step checkpoint".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunPointerRecord {
+    path: PathBuf,
+    state: CompleteUmbrellaRunPointer,
+}
+
+#[derive(Clone, Debug)]
+struct RunPointerStore {
+    root: PathBuf,
+}
+
+impl RunPointerStore {
+    fn live() -> Result<Self, String> {
+        let home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or("HOME is required for the complete-umbrella run pointer")?;
+        Ok(Self {
+            root: session_pointer_root(Some(&home)),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    fn create(&self, state: CompleteUmbrellaRunPointer) -> Result<RunPointerRecord, String> {
+        self.ensure_root()?;
+        let _activity_lock = lock_session_activity(&self.root)?;
+        let records = self.list_unlocked()?;
+        if records.iter().any(|record| {
+            (record.state.repository == state.repository && record.state.umbrella == state.umbrella)
+                || record.state.session_pid == state.session_pid
+        }) {
+            return Err(
+                "a matching complete-umbrella run pointer already exists; resume it first"
+                    .to_owned(),
+            );
+        }
+        let path = self.pointer_path(state.session_pid)?;
+        private_atomic_write(&path, &state.render()?, &self.root)
+            .map_err(|error| error.to_string())?;
+        Ok(RunPointerRecord { path, state })
+    }
+
+    fn resume_candidate(
+        &self,
+        repository: &str,
+        umbrella: u64,
+    ) -> Result<Option<RunPointerRecord>, String> {
+        let records = self.list()?;
+        let mut candidates = records
+            .into_iter()
+            .filter(|record| record.state.umbrella == umbrella)
+            .collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            return Err("multiple complete-umbrella run pointers match this issue".to_owned());
+        }
+        let Some(candidate) = candidates.pop() else {
+            return Ok(None);
+        };
+        if candidate.state.repository != repository {
+            return Err("complete-umbrella run pointer repository mismatch".to_owned());
+        }
+        Ok(Some(candidate))
+    }
+
+    fn for_run(
+        &self,
+        repository: &str,
+        umbrella: u64,
+        tmpdir: &Path,
+    ) -> Result<RunPointerRecord, String> {
+        let records = self.list()?;
+        let mut candidates = records
+            .into_iter()
+            .filter(|record| {
+                record.state.repository == repository
+                    && record.state.umbrella == umbrella
+                    && record.state.tmpdir == tmpdir
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(if candidates.is_empty() {
+                "matching complete-umbrella run pointer is missing".to_owned()
+            } else {
+                "multiple complete-umbrella run pointers match this run".to_owned()
+            });
+        }
+        Ok(candidates.remove(0))
+    }
+
+    fn update(
+        &self,
+        record: &RunPointerRecord,
+        state: CompleteUmbrellaRunPointer,
+    ) -> Result<RunPointerRecord, String> {
+        if state.repository != record.state.repository
+            || state.umbrella != record.state.umbrella
+            || state.tmpdir != record.state.tmpdir
+            || state.session_pid != record.state.session_pid
+        {
+            return Err("run pointer update changed immutable identity".to_owned());
+        }
+        self.ensure_root()?;
+        let _activity_lock = lock_session_activity(&self.root)?;
+        let current = self.read_record_unlocked(&record.path)?;
+        if current.state != record.state {
+            return Err("run pointer changed before update".to_owned());
+        }
+        private_atomic_write(&record.path, &state.render()?, &self.root)
+            .map_err(|error| error.to_string())?;
+        Ok(RunPointerRecord {
+            path: record.path.clone(),
+            state,
+        })
+    }
+
+    fn rebind(
+        &self,
+        record: &RunPointerRecord,
+        session_pid: u32,
+    ) -> Result<RunPointerRecord, String> {
+        if session_pid == 0 {
+            return Err("--claude-pid must be a positive integer".to_owned());
+        }
+        self.ensure_root()?;
+        let _activity_lock = lock_session_activity(&self.root)?;
+        let current = self.read_record_unlocked(&record.path)?;
+        if current.state != record.state {
+            return Err("run pointer changed before session rebind".to_owned());
+        }
+        let mut state = current.state;
+        state.session_pid = session_pid;
+        let path = self.pointer_path(session_pid)?;
+        if path != record.path && fs::symlink_metadata(&path).is_ok() {
+            return Err("the resumed session already owns another run pointer".to_owned());
+        }
+        private_atomic_write(&path, &state.render()?, &self.root)
+            .map_err(|error| error.to_string())?;
+        if path != record.path {
+            remove_regular_pointer(&record.path, &self.root)?;
+        }
+        Ok(RunPointerRecord { path, state })
+    }
+
+    fn remove(&self, record: &RunPointerRecord) -> Result<(), String> {
+        self.ensure_root()?;
+        let _activity_lock = lock_session_activity(&self.root)?;
+        let current = self.read_record_unlocked(&record.path)?;
+        if current.state != record.state {
+            return Err("run pointer changed before removal".to_owned());
+        }
+        remove_regular_pointer(&record.path, &self.root)
+    }
+
+    fn list(&self) -> Result<Vec<RunPointerRecord>, String> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        self.ensure_root()?;
+        let _activity_lock = lock_session_activity(&self.root)?;
+        self.list_unlocked()
+    }
+
+    fn list_unlocked(&self) -> Result<Vec<RunPointerRecord>, String> {
+        let entries = fs::read_dir(&self.root).map_err(|error| {
+            format!("could not enumerate complete-umbrella run pointers: {error}")
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    format!("could not enumerate complete-umbrella run pointers: {error}")
+                })?
+                .path();
+            if path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(RUN_POINTER_PREFIX) && name.ends_with(RUN_POINTER_SUFFIX)
+            }) {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+            .iter()
+            .map(|path| self.read_record_unlocked(path))
+            .collect()
+    }
+
+    fn read_record_unlocked(&self, path: &Path) -> Result<RunPointerRecord, String> {
+        let session_pid = pointer_pid(path)?;
+        let (bytes, truncated) = read_confined_regular_tail(
+            path,
+            &self.root,
+            RUN_POINTER_MAX_BYTES,
+            "complete-umbrella run pointer is unsafe",
+        )
+        .map_err(|error| error.to_string())?;
+        if truncated {
+            return Err("complete-umbrella run pointer exceeds its size limit".to_owned());
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| "complete-umbrella run pointer is not UTF-8".to_owned())?;
+        let state = CompleteUmbrellaRunPointer::parse(&text)?;
+        if state.session_pid != session_pid {
+            return Err("run pointer filename and session pid disagree".to_owned());
+        }
+        Ok(RunPointerRecord {
+            path: path.to_path_buf(),
+            state,
+        })
+    }
+
+    fn pointer_path(&self, session_pid: u32) -> Result<PathBuf, String> {
+        if session_pid == 0 {
+            return Err("session pid must be a positive integer".to_owned());
+        }
+        Ok(self.root.join(format!(
+            "{RUN_POINTER_PREFIX}{session_pid}{RUN_POINTER_SUFFIX}"
+        )))
+    }
+
+    fn ensure_root(&self) -> Result<(), String> {
+        assert_no_symlink_ancestors(&self.root)?;
+        create_directories(&self.root)?;
+        checked_dir(&self.root, "complete-umbrella pointer root", true)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn pointer_pid(path: &Path) -> Result<u32, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("complete-umbrella run pointer has an invalid filename")?;
+    let raw = name
+        .strip_prefix(RUN_POINTER_PREFIX)
+        .and_then(|value| value.strip_suffix(RUN_POINTER_SUFFIX))
+        .ok_or("complete-umbrella run pointer has an invalid filename")?;
+    if !is_valid_claude_pid(raw) {
+        return Err("complete-umbrella run pointer has an invalid session key".to_owned());
+    }
+    raw.parse::<u32>()
+        .map_err(|_| "complete-umbrella run pointer has an invalid session key".to_owned())
+}
+
+fn validate_pointer_tmpdir(path: &Path) -> Result<(), String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err("run pointer tmpdir must be an absolute normalized path".to_owned());
+    }
+    path.to_str()
+        .filter(|value| !value.contains(['\n', '\r']))
+        .ok_or_else(|| "run pointer tmpdir must be valid single-line UTF-8".to_owned())?;
+    Ok(())
+}
+
+fn parse_positive_u64(value: &str, label: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("{label} must be a positive integer"))
+}
+
+fn remove_regular_pointer(path: &Path, root: &Path) -> Result<(), String> {
+    if path.parent() != Some(root) {
+        return Err("complete-umbrella run pointer escapes its root".to_owned());
+    }
+    let file_name = path
+        .file_name()
+        .ok_or("complete-umbrella run pointer has no filename")?;
+    let root_guard = TemporaryRoot::resolve(Some(root)).map_err(|error| error.to_string())?;
+    let confined = root_guard
+        .confine(file_name, PathIntent::Cleanup)
+        .map_err(|_| "complete-umbrella run pointer is unsafe".to_owned())?;
+    let metadata = fs::symlink_metadata(confined.path())
+        .map_err(|error| format!("could not inspect complete-umbrella run pointer: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("complete-umbrella run pointer is unsafe".to_owned());
+    }
+    confined.revalidate().map_err(|error| error.to_string())?;
+    fs::remove_file(confined.path()).map_err(|error| error.to_string())?;
+    match fs::symlink_metadata(confined.path()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not verify complete-umbrella run pointer removal: {error}"
+        )),
+        Ok(_) => Err("complete-umbrella run pointer removal did not converge".to_owned()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChildResultStatus {
@@ -92,7 +583,12 @@ fn child_terminal_status(text: &str) -> Option<ChildResultStatus> {
 #[derive(Subcommand)]
 pub enum CompleteUmbrellaCommand {
     /// Mark the parent active after validating its durable umbrella identity.
-    Start(ParentMutationArguments),
+    Start(StartArguments),
+    /// Recover one durable complete-umbrella run owned by an earlier session.
+    Resume(ResumeArguments),
+    /// Remove one terminal run pointer after diagnostics have been recorded.
+    #[command(name = "clear-pointer")]
+    ClearPointer(ClearPointerArguments),
     /// Fetch a fresh graph snapshot and select the next runnable leaf.
     Next(NextArguments),
     /// Run the deterministic leaf-selection, synchronization, child, and verification loop.
@@ -117,7 +613,7 @@ pub enum CompleteUmbrellaCommand {
     #[command(name = "attach-leaf")]
     AttachLeaf(AttachLeafArguments),
     /// Mark the audited parent done and close it as completed.
-    Finish(ParentMutationArguments),
+    Finish(FinishArguments),
 }
 
 #[derive(Args)]
@@ -129,7 +625,43 @@ pub struct ResetLeafArguments {
 }
 
 #[derive(Args)]
-pub struct ParentMutationArguments {
+pub struct StartArguments {
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    issue: u64,
+    #[arg(long)]
+    tmpdir: PathBuf,
+    #[arg(long = "claude-pid")]
+    claude_pid: u32,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    operator_invoked: bool,
+}
+
+#[derive(Args)]
+pub struct ResumeArguments {
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    issue: u64,
+    #[arg(long = "claude-pid")]
+    claude_pid: Option<u32>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    operator_invoked: bool,
+}
+
+#[derive(Args)]
+pub struct ClearPointerArguments {
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    issue: u64,
+    #[arg(long)]
+    tmpdir: PathBuf,
+}
+
+#[derive(Args)]
+pub struct FinishArguments {
     #[arg(long)]
     repository: String,
     #[arg(long)]
@@ -228,6 +760,8 @@ pub struct RunChildArguments {
     umbrella: u64,
     #[arg(long)]
     leaf: u64,
+    #[arg(long, default_value_t = 0)]
+    transient_attempt_count: u8,
     #[arg(long)]
     model: String,
     #[arg(long)]
@@ -282,6 +816,66 @@ enum ChildAttempt {
     NeedsDesign,
     TransientApi(String),
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableChildResult {
+    Complete,
+    NeedsDesign,
+    TransientApi,
+    Failed,
+}
+
+impl DurableChildResult {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::NeedsDesign => "needs-design",
+            Self::TransientApi | Self::Failed => "failed",
+        }
+    }
+
+    const fn failure_class(self) -> Option<&'static str> {
+        match self {
+            Self::NeedsDesign => Some(COMPLETE_UMBRELLA_CHILD_FAILURE_NEEDS_DESIGN),
+            Self::TransientApi => Some(COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API),
+            Self::Complete | Self::Failed => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeAction {
+    Wait,
+    Reselect,
+    NeedsDesign,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeBgjobState {
+    None,
+    Live,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResumeDecision {
+    action: ResumeAction,
+    reset_active_leaf: bool,
+    transient_attempt_count: u8,
+    failure_reason: Option<&'static str>,
+}
+
+impl ResumeAction {
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Reselect => "reselect",
+            Self::NeedsDesign => "needs-design",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,6 +934,7 @@ enum RunLeavesEnvelope {
         action: &'static str,
         leaf: u64,
         completed: usize,
+        transient_attempt_count: u8,
     },
     Audit {
         completed: usize,
@@ -364,6 +959,7 @@ impl RunLeavesEnvelope {
                 action,
                 leaf,
                 completed,
+                transient_attempt_count: _,
             } => vec![
                 ("NEXT_ACTION", (*action).to_owned()),
                 ("CURRENT_LEAF", leaf.to_string()),
@@ -406,12 +1002,15 @@ trait RunLeavesOperations {
     fn run_child(&mut self, leaf: u64) -> ChildAttempt;
     fn reset_leaf(&mut self, leaf: u64) -> Result<(), String>;
     fn write_result(&mut self, envelope: &RunLeavesEnvelope) -> Result<(), String>;
+    fn transient_attempt_count(&self, leaf: u64) -> u8;
 }
 
 #[must_use]
 pub fn run(command: CompleteUmbrellaCommand) -> ExitCode {
     let result = match command {
         CompleteUmbrellaCommand::Start(arguments) => start(&arguments),
+        CompleteUmbrellaCommand::Resume(arguments) => resume(&arguments),
+        CompleteUmbrellaCommand::ClearPointer(arguments) => clear_pointer(&arguments),
         CompleteUmbrellaCommand::Next(arguments) => next(&arguments),
         CompleteUmbrellaCommand::RunLeaves(arguments) => run_leaves(&arguments),
         CompleteUmbrellaCommand::RunChild(arguments) => run_child(&arguments),
@@ -433,16 +1032,37 @@ pub fn run(command: CompleteUmbrellaCommand) -> ExitCode {
     }
 }
 
-fn start(arguments: &ParentMutationArguments) -> Result<(), String> {
+fn start(arguments: &StartArguments) -> Result<(), String> {
     require_operator(arguments.operator_invoked)?;
     require_issue(arguments.issue, "--issue")?;
     let repository = parse_repository(&arguments.repository)?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let tmpdir = canonical_directory(&arguments.tmpdir, "--tmpdir")?;
+    validate_session_pid(arguments.claude_pid)?;
+    let store = RunPointerStore::live()?;
+    let record = store.create(CompleteUmbrellaRunPointer::initial(
+        repository_name,
+        arguments.issue,
+        tmpdir,
+        arguments.claude_pid,
+    ))?;
     with_github_service(async |service, cancellation| {
         start_remote(service, cancellation, &repository, arguments.issue).await
     })
     .map_err(ServiceFailure::into_detail)?;
+    let mut state = record.state.clone();
+    state.current_step = RunPointerStep::Select;
+    let record = store.update(&record, state)?;
     emit_kv("UMBRELLA_STARTED", "true");
     emit_kv("UMBRELLA_ISSUE", &arguments.issue.to_string());
+    emit_kv(
+        "COMPLETE_UMBRELLA_TMPDIR",
+        &record.state.tmpdir.display().to_string(),
+    );
+    emit_kv(
+        "COMPLETE_UMBRELLA_POINTER",
+        &record.path.display().to_string(),
+    );
     Ok(())
 }
 
@@ -485,6 +1105,444 @@ async fn start_remote(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeLeafState {
+    Done,
+    Active,
+    Idle,
+}
+
+fn resume(arguments: &ResumeArguments) -> Result<(), String> {
+    require_issue(arguments.issue, "--issue")?;
+    let session_pid = arguments.claude_pid.unwrap_or_else(std::process::id);
+    validate_session_pid(session_pid)?;
+    let repository = parse_repository(&arguments.repository)?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let store = RunPointerStore::live()?;
+    let Some(record) = store.resume_candidate(&repository_name, arguments.issue)? else {
+        emit_kv("RESUME_FOUND", "false");
+        return Ok(());
+    };
+    let tmpdir = canonical_directory(&record.state.tmpdir, "run pointer tmpdir")?;
+    if tmpdir != record.state.tmpdir {
+        return Err("complete-umbrella run pointer tmpdir identity changed".to_owned());
+    }
+    let mut record = store.rebind(&record, session_pid)?;
+    match resume_bgjob_state(&record.state, session_pid)? {
+        ResumeBgjobState::Completed
+            if record.state.current_step == RunPointerStep::Audit
+                && resume_audit_requires_reselection(&repository, &record.state)? =>
+        {
+            record.state.current_leaf = None;
+            record.state.current_step = RunPointerStep::Select;
+            record.state.transient_attempt_count = 0;
+            record = store.update(&record, record.state.clone())?;
+            emit_resume(&record, ResumeAction::Reselect, None, None);
+            return Ok(());
+        }
+        ResumeBgjobState::Live | ResumeBgjobState::Completed => {
+            emit_resume(&record, ResumeAction::Wait, None, None);
+            return Ok(());
+        }
+        ResumeBgjobState::None => {}
+    }
+
+    let child_result = record
+        .state
+        .current_leaf
+        .map(|leaf| {
+            read_durable_child_result(
+                &record.state.tmpdir,
+                leaf,
+                record.state.transient_attempt_count,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let leaf_state = resume_leaf_state(&repository, &record.state, arguments.operator_invoked)?;
+    let decision = decide_resume_recovery(&record.state, child_result, leaf_state);
+    if decision.reset_active_leaf {
+        reset_resume_leaf_if_active(
+            &repository,
+            &record.state,
+            leaf_state,
+            arguments.operator_invoked,
+        )?;
+    }
+    record.state.transient_attempt_count = decision.transient_attempt_count;
+    record.state.current_step = match decision.action {
+        ResumeAction::Reselect => RunPointerStep::Select,
+        ResumeAction::NeedsDesign | ResumeAction::Failed => RunPointerStep::Failed,
+        ResumeAction::Wait => record.state.current_step,
+    };
+    record = store.update(&record, record.state.clone())?;
+    emit_resume(
+        &record,
+        decision.action,
+        child_result,
+        decision.failure_reason,
+    );
+    Ok(())
+}
+
+fn decide_resume_recovery(
+    pointer: &CompleteUmbrellaRunPointer,
+    child_result: Option<DurableChildResult>,
+    leaf_state: Option<ResumeLeafState>,
+) -> ResumeDecision {
+    let decision =
+        |action, reset_active_leaf, transient_attempt_count, failure_reason| ResumeDecision {
+            action,
+            reset_active_leaf,
+            transient_attempt_count,
+            failure_reason,
+        };
+    if leaf_state == Some(ResumeLeafState::Done) {
+        return decision(
+            ResumeAction::Reselect,
+            false,
+            pointer.transient_attempt_count,
+            None,
+        );
+    }
+    let reset = leaf_state == Some(ResumeLeafState::Active);
+    match child_result {
+        Some(DurableChildResult::TransientApi)
+            if pointer.transient_attempt_count < MAX_TRANSIENT_CHILD_RETRIES =>
+        {
+            decision(
+                ResumeAction::Reselect,
+                reset,
+                pointer.transient_attempt_count + 1,
+                None,
+            )
+        }
+        Some(DurableChildResult::TransientApi) => decision(
+            ResumeAction::Failed,
+            reset,
+            pointer.transient_attempt_count,
+            Some("transient Claude API retry cap was already exhausted"),
+        ),
+        Some(DurableChildResult::NeedsDesign) => decision(
+            ResumeAction::NeedsDesign,
+            reset,
+            pointer.transient_attempt_count,
+            Some("leaf requires /design before implementation"),
+        ),
+        Some(DurableChildResult::Failed) => decision(
+            ResumeAction::Failed,
+            reset,
+            pointer.transient_attempt_count,
+            Some("dead child recorded an unrecoverable failure"),
+        ),
+        None if pointer.current_step == RunPointerStep::Failed => decision(
+            ResumeAction::Failed,
+            false,
+            pointer.transient_attempt_count,
+            Some("the prior leaf driver recorded a terminal failure"),
+        ),
+        None if pointer.current_step == RunPointerStep::Audit => decision(
+            ResumeAction::Failed,
+            false,
+            pointer.transient_attempt_count,
+            Some("the prior audit result lacks a completed bgjob envelope"),
+        ),
+        Some(DurableChildResult::Complete) | None => decision(
+            ResumeAction::Reselect,
+            reset,
+            pointer.transient_attempt_count,
+            None,
+        ),
+    }
+}
+
+fn resume_bgjob_state(
+    pointer: &CompleteUmbrellaRunPointer,
+    session_pid: u32,
+) -> Result<ResumeBgjobState, String> {
+    let result_path =
+        result_env_path(&pointer.tmpdir, &pointer.bgjob_step).map_err(|error| error.to_string())?;
+    let completed =
+        read_completed_result(&pointer.tmpdir, &result_path, &pointer.bgjob_step).is_some();
+    let mut matching_entries = iter_entries()
+        .into_iter()
+        .filter_map(|(path, entry)| entry.map(|entry| (path, entry)))
+        .filter(|(_, entry)| {
+            if entry.tmpdir != pointer.tmpdir {
+                return false;
+            }
+            entry.step == pointer.bgjob_step
+        })
+        .collect::<Vec<_>>();
+    if matching_entries.len() > 1 {
+        return Err("multiple bgjob registry entries match the run pointer".to_owned());
+    }
+    let Some((registry_path, entry)) = matching_entries.pop() else {
+        return Ok(completed_bgjob_state(pointer, completed));
+    };
+    let host = SystemProcessIdentityHost::new();
+    if daemon_liveness(&host, &entry).live || child_liveness(&host, &entry).live {
+        refresh_wait_lease_for_pid(&pointer.tmpdir, &pointer.bgjob_step, session_pid)
+            .map_err(|error| error.to_string())?;
+        return Ok(ResumeBgjobState::Live);
+    }
+    match recover_abandoned_entry(
+        &host,
+        &registry_path,
+        &entry,
+        "complete-umbrella-resume",
+        "resume-dead-driver",
+    ) {
+        BgjobRecoveryOutcome::Busy => {
+            refresh_wait_lease_for_pid(&pointer.tmpdir, &pointer.bgjob_step, session_pid)
+                .map_err(|error| error.to_string())?;
+            Ok(ResumeBgjobState::Live)
+        }
+        BgjobRecoveryOutcome::Recovered | BgjobRecoveryOutcome::Gone => {
+            let completed =
+                read_completed_result(&pointer.tmpdir, &result_path, &pointer.bgjob_step).is_some();
+            Ok(completed_bgjob_state(pointer, completed))
+        }
+        BgjobRecoveryOutcome::Failed(reason) => Err(format!(
+            "could not recover the dead complete-umbrella bgjob: {reason}"
+        )),
+    }
+}
+
+const fn completed_bgjob_state(
+    pointer: &CompleteUmbrellaRunPointer,
+    completed: bool,
+) -> ResumeBgjobState {
+    if completed
+        && !matches!(
+            pointer.current_step,
+            RunPointerStep::Start | RunPointerStep::Select
+        )
+    {
+        ResumeBgjobState::Completed
+    } else {
+        ResumeBgjobState::None
+    }
+}
+
+fn resume_audit_requires_reselection(
+    repository: &GitHubRepositoryRef,
+    pointer: &CompleteUmbrellaRunPointer,
+) -> Result<bool, String> {
+    with_github_service(async |service, cancellation| {
+        let graph = read_graph(service, cancellation, repository, pointer.umbrella).await?;
+        audit_graph_requires_reselection(&graph)
+    })
+    .map_err(ServiceFailure::into_detail)
+}
+
+fn audit_graph_requires_reselection(graph: &GraphState) -> Result<bool, String> {
+    if graph.parent.state == GitHubIssueState::Closed {
+        return Ok(false);
+    }
+    require_active_parent(graph)?;
+    Ok(!graph.open_orphan_blockers.is_empty()
+        || graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.issue.state == GitHubIssueState::Open))
+}
+
+fn read_durable_child_result(
+    tmpdir: &Path,
+    leaf: u64,
+    transient_attempt_count: u8,
+) -> Result<Option<DurableChildResult>, String> {
+    let path = tmpdir
+        .join("complete-umbrella-run-leaves")
+        .join(format!("child-{leaf}.env"));
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect durable child result: {error}")),
+        Ok(_) => {}
+    }
+    let root = temporary_root(tmpdir, "run pointer tmpdir")?;
+    let text = read_expected_file(&path, tmpdir, &root, "durable child result", 64 * 1024)?;
+    parse_durable_child_result(&text, leaf, transient_attempt_count)
+}
+
+fn parse_durable_child_result(
+    text: &str,
+    leaf: u64,
+    transient_attempt_count: u8,
+) -> Result<Option<DurableChildResult>, String> {
+    let environment = EnvFile::parse(text)
+        .map_err(|error| format!("durable child result is malformed: {error}"))?;
+    let values = environment.values();
+    let expected_leaf = leaf.to_string();
+    if values.get("CHILD_ISSUE") != Some(&expected_leaf) {
+        return Err("durable child result carries another leaf identity".to_owned());
+    }
+    let recorded_attempt = values
+        .get("CHILD_TRANSIENT_ATTEMPT_COUNT")
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|attempt| *attempt <= MAX_TRANSIENT_CHILD_RETRIES)
+        .ok_or("durable child result has an invalid transient-attempt identity")?;
+    let status = values.get("CHILD_STATUS").map(String::as_str);
+    let complete = values.get("CHILD_ENVELOPE_COMPLETE").map(String::as_str);
+    let class = values.get("CHILD_FAILURE_CLASS").map(String::as_str);
+    let result = match (status, complete, class, values.len()) {
+        (Some("complete"), Some("true"), None, 4) => DurableChildResult::Complete,
+        (
+            Some("needs-design"),
+            Some("false"),
+            Some(COMPLETE_UMBRELLA_CHILD_FAILURE_NEEDS_DESIGN),
+            5,
+        ) => DurableChildResult::NeedsDesign,
+        (Some("failed"), Some("false"), Some(COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API), 5) => {
+            DurableChildResult::TransientApi
+        }
+        (Some("failed"), Some("false"), None, 4) => DurableChildResult::Failed,
+        _ => return Err("durable child result has an invalid terminal shape".to_owned()),
+    };
+    if recorded_attempt == transient_attempt_count {
+        return Ok(Some(result));
+    }
+    if recorded_attempt.checked_add(1) == Some(transient_attempt_count)
+        && result == DurableChildResult::TransientApi
+    {
+        return Ok(None);
+    }
+    Err("durable child result carries another transient-attempt identity".to_owned())
+}
+
+fn resume_leaf_state(
+    repository: &GitHubRepositoryRef,
+    pointer: &CompleteUmbrellaRunPointer,
+    operator_invoked: bool,
+) -> Result<Option<ResumeLeafState>, String> {
+    with_github_service(async |service, cancellation| {
+        let mut graph = read_graph(service, cancellation, repository, pointer.umbrella).await?;
+        if require_active_parent(&graph).is_err() {
+            if pointer.current_step != RunPointerStep::Start {
+                return Err("resume target parent is not active".to_owned());
+            }
+            require_operator(operator_invoked)?;
+            start_remote(service, cancellation, repository, pointer.umbrella).await?;
+            graph = read_graph(service, cancellation, repository, pointer.umbrella).await?;
+            require_active_parent(&graph)?;
+        }
+        let Some(leaf_number) = pointer.current_leaf else {
+            return Ok(None);
+        };
+        let leaf = graph
+            .leaves
+            .iter()
+            .find(|leaf| leaf.issue.number == leaf_number)
+            .ok_or("run pointer leaf is not a direct leaf of the umbrella")?;
+        if leaf.issue.state == GitHubIssueState::Closed {
+            verify_child_in_graph(&graph, leaf_number)?;
+            return Ok(Some(ResumeLeafState::Done));
+        }
+        if leaf.issue.title.starts_with(IMPLEMENTING_PREFIX) {
+            Ok(Some(ResumeLeafState::Active))
+        } else {
+            Ok(Some(ResumeLeafState::Idle))
+        }
+    })
+    .map_err(ServiceFailure::into_detail)
+}
+
+fn reset_resume_leaf_if_active(
+    repository: &GitHubRepositoryRef,
+    pointer: &CompleteUmbrellaRunPointer,
+    leaf_state: Option<ResumeLeafState>,
+    operator_invoked: bool,
+) -> Result<(), String> {
+    if leaf_state != Some(ResumeLeafState::Active) {
+        return Ok(());
+    }
+    require_operator(operator_invoked)?;
+    let leaf = pointer
+        .current_leaf
+        .ok_or("active resume state is missing its leaf identity")?;
+    let arguments = LeafArguments {
+        repository: pointer.repository.clone(),
+        umbrella: pointer.umbrella,
+        leaf,
+    };
+    with_github_service(async |service, cancellation| {
+        reset_leaf_remote(service, cancellation, repository, &arguments).await
+    })
+    .map_err(ServiceFailure::into_detail)
+}
+
+fn emit_resume(
+    record: &RunPointerRecord,
+    action: ResumeAction,
+    child_result: Option<DurableChildResult>,
+    failure_reason: Option<&str>,
+) {
+    emit_kv("RESUME_FOUND", "true");
+    emit_kv("RESUME_ACTION", action.value());
+    emit_kv(
+        "COMPLETE_UMBRELLA_TMPDIR",
+        &record.state.tmpdir.display().to_string(),
+    );
+    emit_kv(
+        "COMPLETE_UMBRELLA_POINTER",
+        &record.path.display().to_string(),
+    );
+    emit_kv("BGJOB_STEP", &record.state.bgjob_step);
+    emit_kv(
+        "CURRENT_LEAF",
+        &record.state.current_leaf.map_or(0, |leaf| leaf).to_string(),
+    );
+    emit_kv("CURRENT_STEP", record.state.current_step.value());
+    emit_kv(
+        "TRANSIENT_ATTEMPT_COUNT",
+        &record.state.transient_attempt_count.to_string(),
+    );
+    if let Some(result) = child_result {
+        emit_kv("CHILD_STATUS", result.status());
+        if let Some(class) = result.failure_class() {
+            emit_kv("CHILD_FAILURE_CLASS", class);
+        }
+    }
+    if matches!(action, ResumeAction::NeedsDesign | ResumeAction::Failed) {
+        emit_kv(
+            "NEXT_ACTION",
+            if action == ResumeAction::NeedsDesign {
+                "needs-design"
+            } else {
+                "failed"
+            },
+        );
+        emit_kv("FAILED_STEP", "run-child");
+        emit_kv(
+            "FAILED_LEAF",
+            &record.state.current_leaf.map_or(0, |leaf| leaf).to_string(),
+        );
+        emit_kv("FAILURE_REASON", failure_reason.unwrap_or("resume failed"));
+    }
+}
+
+fn clear_pointer(arguments: &ClearPointerArguments) -> Result<(), String> {
+    require_issue(arguments.issue, "--issue")?;
+    let repository = parse_repository(&arguments.repository)?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let tmpdir = canonical_directory(&arguments.tmpdir, "--tmpdir")?;
+    let store = RunPointerStore::live()?;
+    let candidate = store.resume_candidate(&repository_name, arguments.issue)?;
+    let Some(record) = candidate else {
+        emit_kv("POINTER_CLEARED", "true");
+        emit_kv("POINTER_FOUND", "false");
+        return Ok(());
+    };
+    if record.state.tmpdir != tmpdir {
+        return Err("refusing to clear a run pointer for another tmpdir".to_owned());
+    }
+    store.remove(&record)?;
+    emit_kv("POINTER_CLEARED", "true");
+    emit_kv("POINTER_FOUND", "true");
+    Ok(())
+}
+
 fn next(arguments: &NextArguments) -> Result<(), String> {
     require_issue(arguments.issue, "--issue")?;
     let repository = parse_repository(&arguments.repository)?;
@@ -492,7 +1550,35 @@ fn next(arguments: &NextArguments) -> Result<(), String> {
         read_graph(service, cancellation, &repository, arguments.issue).await
     })
     .map_err(ServiceFailure::into_detail)?;
-    emit_next(arguments, &graph)
+    emit_next(arguments, &graph)?;
+    let tmpdir = canonical_directory(&arguments.output_root, "--output-root")?;
+    let store = RunPointerStore::live()?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let record = store.for_run(&repository_name, arguments.issue, &tmpdir)?;
+    let selection = select_complete_umbrella_leaf(
+        &selection_leaves(&graph.leaves),
+        &graph.open_orphan_blockers,
+    );
+    let mut state = record.state.clone();
+    match selection {
+        CompleteUmbrellaNext::Launch(leaf) => {
+            state.current_leaf = Some(leaf);
+            state.current_step = RunPointerStep::Launch;
+            if record.state.current_leaf != Some(leaf) {
+                state.transient_attempt_count = 0;
+            }
+        }
+        CompleteUmbrellaNext::Audit => {
+            state.current_leaf = None;
+            state.current_step = RunPointerStep::Audit;
+            state.transient_attempt_count = 0;
+        }
+        CompleteUmbrellaNext::OrphanBlocked(_) | CompleteUmbrellaNext::Deadlocked(_) => {
+            state.current_step = RunPointerStep::Failed;
+        }
+    }
+    store.update(&record, state)?;
+    Ok(())
 }
 
 fn run_leaves(arguments: &RunLeavesArguments) -> Result<(), String> {
@@ -602,23 +1688,36 @@ fn run_selected_leaf(
     leaf: u64,
     completed: usize,
 ) -> Result<(), RunLeavesFailure> {
-    write_run_leaves_progress(operations, "launch", leaf, completed)?;
+    let transient_attempt_count = operations.transient_attempt_count(leaf);
+    write_run_leaves_progress(
+        operations,
+        "launch",
+        leaf,
+        completed,
+        transient_attempt_count,
+    )?;
     operations
         .sync_main()
         .map_err(|error| RunLeavesFailure::failed("sync-before-child", Some(leaf), error))?;
-    run_child_attempts(operations, leaf, completed)?;
+    run_child_attempts(operations, leaf, completed, transient_attempt_count)?;
     operations
         .sync_main()
         .map_err(|error| RunLeavesFailure::failed("sync-after-child", Some(leaf), error))?;
-    write_run_leaves_progress(operations, "verify", leaf, completed)
+    write_run_leaves_progress(
+        operations,
+        "verify",
+        leaf,
+        completed,
+        operations.transient_attempt_count(leaf),
+    )
 }
 
 fn run_child_attempts(
     operations: &mut impl RunLeavesOperations,
     leaf: u64,
     completed: usize,
+    mut transient_retries: u8,
 ) -> Result<(), RunLeavesFailure> {
-    let mut transient_retries = 0;
     loop {
         match operations.run_child(leaf) {
             ChildAttempt::Complete => return Ok(()),
@@ -643,7 +1742,13 @@ fn run_child_attempts(
                         format!("transient child reset failed: {error}"),
                     )
                 })?;
-                write_run_leaves_progress(operations, "launch", leaf, completed)?;
+                write_run_leaves_progress(
+                    operations,
+                    "launch",
+                    leaf,
+                    completed,
+                    transient_retries,
+                )?;
                 operations.sync_main().map_err(|error| {
                     RunLeavesFailure::failed("sync-before-retry", Some(leaf), error)
                 })?;
@@ -677,12 +1782,14 @@ fn write_run_leaves_progress(
     action: &'static str,
     leaf: u64,
     completed: usize,
+    transient_attempt_count: u8,
 ) -> Result<(), RunLeavesFailure> {
     operations
         .write_result(&RunLeavesEnvelope::Progress {
             action,
             leaf,
             completed,
+            transient_attempt_count,
         })
         .map_err(|error| RunLeavesFailure::failed("write-result", Some(leaf), error))
 }
@@ -693,10 +1800,19 @@ struct LiveRunLeavesOperations<'a> {
     repo_root: PathBuf,
     output_root: TemporaryRoot,
     driver_root: PathBuf,
+    pointer_store: RunPointerStore,
+    pointer: RunPointerRecord,
 }
 
 impl<'a> LiveRunLeavesOperations<'a> {
     fn new(arguments: &'a RunLeavesArguments) -> Result<Self, String> {
+        Self::new_with_store(arguments, RunPointerStore::live()?)
+    }
+
+    fn new_with_store(
+        arguments: &'a RunLeavesArguments,
+        pointer_store: RunPointerStore,
+    ) -> Result<Self, String> {
         let repository = parse_repository(&arguments.repository)?;
         let repo_root = canonical_directory(&arguments.repo_root, "--repo-root")?;
         let output_root = temporary_root(&arguments.output_root, "--output-root")?;
@@ -723,12 +1839,19 @@ impl<'a> LiveRunLeavesOperations<'a> {
         if output.path().starts_with(&driver_root) || result_env.path().starts_with(&driver_root) {
             return Err("caller-owned output files must not overlap run-leaves state".to_owned());
         }
+        let pointer = pointer_store.for_run(
+            &format!("{}/{}", repository.owner(), repository.name()),
+            arguments.umbrella,
+            output_root.path(),
+        )?;
         Ok(Self {
             arguments,
             repository,
             repo_root,
             output_root,
             driver_root,
+            pointer_store,
+            pointer,
         })
     }
 
@@ -738,6 +1861,7 @@ impl<'a> LiveRunLeavesOperations<'a> {
             repo_root: self.repo_root.clone(),
             umbrella: self.arguments.umbrella,
             leaf,
+            transient_attempt_count: self.transient_attempt_count(leaf),
             model: self.arguments.model.clone(),
             output_root: self.arguments.output_root.clone(),
             output: self.driver_root.join(format!("child-{leaf}.json")),
@@ -793,7 +1917,7 @@ impl RunLeavesOperations for LiveRunLeavesOperations<'_> {
             "child result env",
             64 * 1024,
         );
-        classify_child_attempt(leaf, execution, result)
+        classify_child_attempt(leaf, arguments.transient_attempt_count, execution, result)
     }
 
     fn reset_leaf(&mut self, leaf: u64) -> Result<(), String> {
@@ -809,6 +1933,36 @@ impl RunLeavesOperations for LiveRunLeavesOperations<'_> {
     }
 
     fn write_result(&mut self, envelope: &RunLeavesEnvelope) -> Result<(), String> {
+        let mut state = self.pointer.state.clone();
+        match envelope {
+            RunLeavesEnvelope::Progress {
+                action,
+                leaf,
+                transient_attempt_count,
+                ..
+            } => {
+                state.current_leaf = Some(*leaf);
+                state.current_step = match *action {
+                    "launch" => RunPointerStep::Launch,
+                    "verify" => RunPointerStep::Verify,
+                    _ => return Err("run-leaves progress has an invalid pointer action".to_owned()),
+                };
+                state.transient_attempt_count = *transient_attempt_count;
+            }
+            RunLeavesEnvelope::Audit { .. } => {
+                state.current_leaf = None;
+                state.current_step = RunPointerStep::Audit;
+                state.transient_attempt_count = 0;
+            }
+            RunLeavesEnvelope::Failure(failure) => {
+                state.current_leaf = failure.leaf;
+                state.current_step = RunPointerStep::Failed;
+                if failure.leaf.is_none() {
+                    state.transient_attempt_count = 0;
+                }
+            }
+        }
+        self.pointer = self.pointer_store.update(&self.pointer, state)?;
         let text = envelope.render()?;
         write_private_file(
             &self.arguments.result_env,
@@ -817,10 +1971,19 @@ impl RunLeavesOperations for LiveRunLeavesOperations<'_> {
             &self.output_root,
         )
     }
+
+    fn transient_attempt_count(&self, leaf: u64) -> u8 {
+        if self.pointer.state.current_leaf == Some(leaf) {
+            self.pointer.state.transient_attempt_count
+        } else {
+            0
+        }
+    }
 }
 
 fn classify_child_attempt(
     leaf: u64,
+    transient_attempt_count: u8,
     execution: Result<(), String>,
     result: Result<String, String>,
 ) -> ChildAttempt {
@@ -849,6 +2012,12 @@ fn classify_child_attempt(
     let expected_leaf = leaf.to_string();
     if values.get("CHILD_ISSUE") != Some(&expected_leaf) {
         return ChildAttempt::Failed("child result carries another leaf identity".to_owned());
+    }
+    let expected_attempt = transient_attempt_count.to_string();
+    if values.get("CHILD_TRANSIENT_ATTEMPT_COUNT") != Some(&expected_attempt) {
+        return ChildAttempt::Failed(
+            "child result carries another transient-attempt identity".to_owned(),
+        );
     }
     let status = values.get("CHILD_STATUS").map(String::as_str);
     let complete = values.get("CHILD_ENVELOPE_COMPLETE").map(String::as_str);
@@ -1033,6 +2202,9 @@ fn next_action_fields(selection: &CompleteUmbrellaNext) -> Vec<(&'static str, St
 fn run_child(arguments: &RunChildArguments) -> Result<(), String> {
     require_issue(arguments.umbrella, "--umbrella")?;
     require_issue(arguments.leaf, "--leaf")?;
+    if arguments.transient_attempt_count > MAX_TRANSIENT_CHILD_RETRIES {
+        return Err("--transient-attempt-count exceeds the retry cap".to_owned());
+    }
     let repository = parse_repository(&arguments.repository)?;
     validate_child_model(&arguments.model)?;
     let repo_root = canonical_directory(&arguments.repo_root, "--repo-root")?;
@@ -1320,6 +2492,8 @@ fn attach_leaf(arguments: &AttachLeafArguments) -> Result<(), String> {
     require_issue(arguments.leaf.umbrella, "--umbrella")?;
     require_issue(arguments.leaf.leaf, "--leaf")?;
     let repository = parse_repository(&arguments.leaf.repository)?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let tmpdir = canonical_directory(&arguments.files.root, "--expected-root")?;
     let expected = read_expected_audit_leaf(arguments.leaf.umbrella, &arguments.files)?;
     with_github_service(async |service, cancellation| {
         attach_leaf_remote(
@@ -1332,9 +2506,25 @@ fn attach_leaf(arguments: &AttachLeafArguments) -> Result<(), String> {
         .await
     })
     .map_err(ServiceFailure::into_detail)?;
+    let store = RunPointerStore::live()?;
+    checkpoint_reselection(&store, &repository_name, arguments.leaf.umbrella, &tmpdir)?;
     emit_kv("LEAF_ATTACHED", "true");
     emit_kv("LEAF_ISSUE", &arguments.leaf.leaf.to_string());
     Ok(())
+}
+
+fn checkpoint_reselection(
+    store: &RunPointerStore,
+    repository: &str,
+    umbrella: u64,
+    tmpdir: &Path,
+) -> Result<(), String> {
+    let record = store.for_run(repository, umbrella, tmpdir)?;
+    let mut state = record.state.clone();
+    state.current_leaf = None;
+    state.current_step = RunPointerStep::Select;
+    state.transient_attempt_count = 0;
+    store.update(&record, state).map(|_| ())
 }
 
 fn validate_gap(arguments: &ValidateGapArguments) -> Result<(), String> {
@@ -1539,16 +2729,23 @@ async fn verify_attachment(
     }
 }
 
-fn finish(arguments: &ParentMutationArguments) -> Result<(), String> {
+fn finish(arguments: &FinishArguments) -> Result<(), String> {
     require_operator(arguments.operator_invoked)?;
     require_issue(arguments.issue, "--issue")?;
     let repository = parse_repository(&arguments.repository)?;
+    let repository_name = format!("{}/{}", repository.owner(), repository.name());
+    let store = RunPointerStore::live()?;
+    let pointer = store.resume_candidate(&repository_name, arguments.issue)?;
     with_github_service(async |service, cancellation| {
         finish_remote(service, cancellation, &repository, arguments.issue).await
     })
     .map_err(ServiceFailure::into_detail)?;
+    if let Some(pointer) = pointer {
+        store.remove(&pointer)?;
+    }
     emit_kv("UMBRELLA_FINISHED", "true");
     emit_kv("UMBRELLA_ISSUE", &arguments.issue.to_string());
+    emit_kv("POINTER_CLEARED", "true");
     Ok(())
 }
 
@@ -1876,6 +3073,14 @@ fn require_issue(issue: u64, option: &str) -> Result<(), String> {
     }
 }
 
+fn validate_session_pid(pid: u32) -> Result<(), String> {
+    if pid == 0 || !is_valid_claude_pid(&pid.to_string()) {
+        Err("--claude-pid must be a positive integer".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_repository(value: &str) -> Result<GitHubRepositoryRef, String> {
     repository_ref(value).map_err(|()| "--repository must use valid OWNER/REPO form".to_owned())
 }
@@ -1951,12 +3156,13 @@ fn write_child_result(
     failure_class: Option<&str>,
 ) -> Result<(), String> {
     let mut text = format!(
-        "CHILD_STATUS={status}\nCHILD_ISSUE={leaf}\nCHILD_ENVELOPE_COMPLETE={}\n",
+        "CHILD_STATUS={status}\nCHILD_ISSUE={leaf}\nCHILD_ENVELOPE_COMPLETE={}\nCHILD_TRANSIENT_ATTEMPT_COUNT={}\n",
         if status.envelope_complete() {
             "true"
         } else {
             "false"
         },
+        arguments.transient_attempt_count,
         status = status.value(),
     );
     if let Some(class) = failure_class {

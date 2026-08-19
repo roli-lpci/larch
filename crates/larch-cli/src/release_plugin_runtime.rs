@@ -16,6 +16,7 @@ const DIRECT_FILES: &[&str] = &[
     "SECURITY.md",
     "docs/analysis-state.md",
     "docs/ci-latency-evidence.md",
+    "docs/complete-umbrella-recovery.md",
     "docs/configuration-and-permissions.md",
     "docs/dev-hook-audit.md",
     "docs/difficulty-floor-globs.tsv",
@@ -444,6 +445,7 @@ mod tests {
         assert!(paths.contains("ARCHITECTURE.md"));
         assert!(paths.contains("SECURITY.md"));
         assert!(paths.contains("docs/git-operation-inventory.md"));
+        assert!(paths.contains("docs/complete-umbrella-recovery.md"));
         assert!(paths.contains("docs/github-service-inventory.md"));
         assert!(paths.contains("docs/google-service-inventory.md"));
         assert!(paths.contains("docs/dev-hook-audit.md"));

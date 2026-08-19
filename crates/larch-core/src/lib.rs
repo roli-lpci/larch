@@ -113,11 +113,11 @@ pub use bgjob::{
     has_live_entry, iter_entries, log_paths, phase_barrier, prepare_completion_transaction,
     private_atomic_write, read_completion_transaction, read_confined_regular_tail,
     read_confined_result_env, read_entry, read_for, read_merge_result_env,
-    recovery_claim_entry_path, refresh_wait_lease, registry_path, registry_root, reject_line_value,
-    release_recovery_claim, resolve_run_id, result_env_path, startup_env_path, unlink_entry,
-    validate_initial_merge_rows, validate_merge_result_env, validate_run_id, validate_slug,
-    validate_terminal_stdout_key, wait_lease_is_fresh, wait_lease_path, worker_status_path,
-    write_entry, write_entry_at,
+    recovery_claim_entry_path, refresh_wait_lease, refresh_wait_lease_for_pid, registry_path,
+    registry_root, reject_line_value, release_recovery_claim, resolve_run_id, result_env_path,
+    startup_env_path, unlink_entry, validate_initial_merge_rows, validate_merge_result_env,
+    validate_run_id, validate_slug, validate_terminal_stdout_key, wait_lease_is_fresh,
+    wait_lease_path, worker_status_path, write_entry, write_entry_at,
 };
 pub use bgjob_daemon::{
     BGJOB_DAEMON_POLL_INTERVAL_S, BGJOB_LOG_TAIL_BYTES, BGJOB_OWNER_GRACE_S,

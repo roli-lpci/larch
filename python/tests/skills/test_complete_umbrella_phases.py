@@ -152,7 +152,7 @@ def test_whole_leaf_loop_bgjob_binds_one_durable_session_owner() -> None:
         encoding="utf-8"
     )
     start = (
-        'LARCH_CLAUDE_PID="$PPID" '
+        'LARCH_CLAUDE_PID="$COMPLETE_UMBRELLA_OWNER_PID" '
         '"${CLAUDE_PLUGIN_ROOT}/scripts/larch.sh" bgjob start'
     )
     assert skill.count(start) == 1
@@ -173,3 +173,21 @@ def test_whole_leaf_loop_bgjob_binds_one_durable_session_owner() -> None:
     ).read_text(encoding="utf-8")
     assert 'LARCH_CLAUDE_PID="$PPID"' in wait_contract
     assert "wait lease" in wait_contract
+
+
+def test_top_level_rehydrates_the_durable_run_pointer_before_start() -> None:
+    skill = (REPO_ROOT / "skills" / "complete-umbrella" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    resume = skill.index("complete-umbrella resume")
+    setup = skill.index("session setup", resume)
+    start = skill.index("complete-umbrella start", setup)
+    assert resume < setup < start
+    assert '--claude-pid "$COMPLETE_UMBRELLA_OWNER_PID"' in skill
+    assert "RESUME_ACTION=wait" in skill
+    assert "RESUME_ACTION=reselect" in skill
+    assert "without truncating a file or starting another bgjob" in skill
+    assert "A resumed `wait` has no new start marker" in skill
+    assert "Set `RESUME_ACTION=reselect`, then return immediately to Step 1" in skill
+    assert "complete-umbrella clear-pointer" in skill
+    assert "POINTER_CLEARED=true" in skill

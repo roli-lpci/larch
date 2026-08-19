@@ -69,6 +69,19 @@ fn repository() -> GitHubRepositoryRef {
     GitHubRepositoryRef::new("o", "r").expect("valid repository")
 }
 
+fn run_pointer(tmpdir: &Path, session_pid: u32) -> CompleteUmbrellaRunPointer {
+    CompleteUmbrellaRunPointer {
+        current_leaf: Some(LEAF),
+        current_step: RunPointerStep::Launch,
+        ..CompleteUmbrellaRunPointer::initial(
+            String::from("o/r"),
+            UMBRELLA,
+            fs::canonicalize(tmpdir).expect("canonical run tmpdir"),
+            session_pid,
+        )
+    }
+}
+
 fn closed_graph(parent: &str, leaf: &str) -> Vec<IssueServiceExchange> {
     closed_graph_with_parent_blockers(parent, leaf, &[(LEAF, 410, "closed")])
 }
@@ -166,10 +179,23 @@ fn command_dispatch_rejects_invalid_inputs_before_remote_work() {
         leaf: LEAF,
     };
     let commands = [
-        CompleteUmbrellaCommand::Start(ParentMutationArguments {
+        CompleteUmbrellaCommand::Start(StartArguments {
             repository: String::from("o/r"),
             issue: UMBRELLA,
+            tmpdir: PathBuf::from("missing"),
+            claude_pid: 1,
             operator_invoked: false,
+        }),
+        CompleteUmbrellaCommand::Resume(ResumeArguments {
+            repository: String::from("o/r"),
+            issue: 0,
+            claude_pid: Some(1),
+            operator_invoked: false,
+        }),
+        CompleteUmbrellaCommand::ClearPointer(ClearPointerArguments {
+            repository: String::from("o/r"),
+            issue: 0,
+            tmpdir: PathBuf::from("missing"),
         }),
         CompleteUmbrellaCommand::Next(NextArguments {
             repository: String::from("o/r"),
@@ -192,6 +218,7 @@ fn command_dispatch_rejects_invalid_inputs_before_remote_work() {
             repo_root: PathBuf::from("missing"),
             umbrella: UMBRELLA,
             leaf: LEAF,
+            transient_attempt_count: 0,
             model: String::from("unknown"),
             output_root: PathBuf::from("relative"),
             output: PathBuf::from("output"),
@@ -222,7 +249,7 @@ fn command_dispatch_rejects_invalid_inputs_before_remote_work() {
             operator_invoked: false,
             files: files(),
         }),
-        CompleteUmbrellaCommand::Finish(ParentMutationArguments {
+        CompleteUmbrellaCommand::Finish(FinishArguments {
             repository: String::from("o/r"),
             issue: UMBRELLA,
             operator_invoked: false,
@@ -318,6 +345,178 @@ fn orphaned_child_recovery_requires_the_exact_transport_and_leaf_identity() {
     );
 }
 
+#[test]
+fn run_pointer_round_trip_rebind_and_ambiguity_fail_closed() {
+    let pointer_root = tempfile::tempdir().expect("pointer root");
+    let run_root = tempfile::tempdir().expect("run root");
+    let store = RunPointerStore::at(pointer_root.path());
+    let record = store
+        .create(run_pointer(run_root.path(), 123))
+        .expect("create run pointer");
+    assert!(record.path.ends_with("current-complete-umbrella-123.env"));
+    assert_eq!(
+        CompleteUmbrellaRunPointer::parse(
+            &fs::read_to_string(&record.path).expect("run pointer text")
+        )
+        .expect("parse run pointer"),
+        record.state
+    );
+    let inconsistent = fs::read_to_string(&record.path)
+        .expect("run pointer text")
+        .replace("CURRENT_STEP=launch", "CURRENT_STEP=audit");
+    assert!(CompleteUmbrellaRunPointer::parse(&inconsistent).is_err());
+
+    let rebound = store.rebind(&record, 456).expect("rebind run pointer");
+    assert!(rebound.path.ends_with("current-complete-umbrella-456.env"));
+    assert!(!record.path.exists());
+    assert_eq!(
+        store
+            .resume_candidate("o/r", UMBRELLA)
+            .expect("resume candidate"),
+        Some(rebound.clone())
+    );
+    assert!(store.resume_candidate("other/r", UMBRELLA).is_err());
+    store.remove(&rebound).expect("remove run pointer");
+    assert!(
+        store
+            .resume_candidate("o/r", UMBRELLA)
+            .expect("missing candidate")
+            .is_none()
+    );
+
+    let other_root = tempfile::tempdir().expect("other run root");
+    store
+        .create(run_pointer(run_root.path(), 111))
+        .expect("first ambiguous pointer");
+    let mut other = run_pointer(other_root.path(), 222);
+    other.repository = String::from("other/r");
+    store.create(other).expect("second ambiguous pointer");
+    assert!(store.resume_candidate("o/r", UMBRELLA).is_err());
+}
+
+#[test]
+fn resume_live_child_rebinds_the_wait_lease_to_the_new_session() {
+    let pointer_root = tempfile::tempdir().expect("pointer root");
+    let run_root = tempfile::tempdir().expect("run root");
+    let store = RunPointerStore::at(pointer_root.path());
+    let record = store
+        .create(run_pointer(run_root.path(), 123))
+        .expect("create run pointer");
+    let rebound = store.rebind(&record, 456).expect("rebind run pointer");
+    refresh_wait_lease_for_pid(
+        &rebound.state.tmpdir,
+        &rebound.state.bgjob_step,
+        rebound.state.session_pid,
+    )
+    .expect("refresh rehydrated wait lease");
+    let lease = fs::read_to_string(
+        larch_core::wait_lease_path(&rebound.state.tmpdir, &rebound.state.bgjob_step)
+            .expect("wait lease path"),
+    )
+    .expect("wait lease text");
+    assert!(lease.contains("WAITER_PID=456\n"));
+    assert_eq!(rebound.state.bgjob_step, RUN_LEAVES_STEP);
+}
+
+#[test]
+fn resume_dead_child_result_preserves_its_failure_class_and_retry_count() {
+    let run_root = tempfile::tempdir().expect("run root");
+    let mut pointer = run_pointer(run_root.path(), 123);
+    let text = format!(
+        "CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\nCHILD_FAILURE_CLASS={COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API}\n"
+    );
+    let result = parse_durable_child_result(&text, LEAF, 0)
+        .expect("durable child result")
+        .expect("current attempt result");
+    assert_eq!(result, DurableChildResult::TransientApi);
+    let stale = parse_durable_child_result(&text, LEAF, 1).expect("stale result is valid");
+    assert_eq!(stale, None);
+    assert!(parse_durable_child_result(&text, LEAF, 2).is_err());
+    pointer.transient_attempt_count = 1;
+    let after_retry_checkpoint =
+        decide_resume_recovery(&pointer, stale, Some(ResumeLeafState::Idle));
+    assert_eq!(after_retry_checkpoint.action, ResumeAction::Reselect);
+    assert_eq!(after_retry_checkpoint.transient_attempt_count, 1);
+
+    pointer.transient_attempt_count = 0;
+    let retry = decide_resume_recovery(&pointer, Some(result), Some(ResumeLeafState::Active));
+    assert_eq!(retry.action, ResumeAction::Reselect);
+    assert!(retry.reset_active_leaf);
+    assert_eq!(retry.transient_attempt_count, 1);
+
+    pointer.transient_attempt_count = MAX_TRANSIENT_CHILD_RETRIES;
+    let exhausted = decide_resume_recovery(&pointer, Some(result), Some(ResumeLeafState::Active));
+    assert_eq!(exhausted.action, ResumeAction::Failed);
+    assert!(exhausted.reset_active_leaf);
+    assert_eq!(
+        result.failure_class(),
+        Some(COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API)
+    );
+}
+
+#[test]
+fn resume_ignores_completed_bgjob_results_after_a_new_selection_checkpoint() {
+    let run_root = tempfile::tempdir().expect("run root");
+    let mut pointer = run_pointer(run_root.path(), 123);
+    pointer.current_step = RunPointerStep::Select;
+    assert_eq!(
+        completed_bgjob_state(&pointer, true),
+        ResumeBgjobState::None
+    );
+    pointer.current_step = RunPointerStep::Launch;
+    assert_eq!(
+        completed_bgjob_state(&pointer, true),
+        ResumeBgjobState::Completed
+    );
+
+    let open_graph = driver_graph(&[(LEAF, GitHubIssueState::Open, false)]);
+    assert!(audit_graph_requires_reselection(&open_graph).expect("active graph"));
+    let closed_graph = driver_graph(&[(LEAF, GitHubIssueState::Closed, false)]);
+    assert!(!audit_graph_requires_reselection(&closed_graph).expect("finished leaf graph"));
+
+    let pointer_root = tempfile::tempdir().expect("pointer root");
+    let store = RunPointerStore::at(pointer_root.path());
+    let record = store
+        .create(pointer.clone())
+        .expect("create audit-loop pointer");
+    checkpoint_reselection(&store, "o/r", UMBRELLA, &pointer.tmpdir)
+        .expect("checkpoint new selection");
+    let checkpoint = store
+        .resume_candidate("o/r", UMBRELLA)
+        .expect("selection candidate")
+        .expect("selection pointer");
+    assert_eq!(checkpoint.state.current_step, RunPointerStep::Select);
+    assert_eq!(checkpoint.state.current_leaf, None);
+    assert_eq!(checkpoint.state.transient_attempt_count, 0);
+    assert_ne!(checkpoint.state, record.state);
+}
+
+#[test]
+fn resume_stuck_title_reselects_and_reuses_the_original_handoff_root() {
+    let pointer_root = tempfile::tempdir().expect("pointer root");
+    let run_root = tempfile::tempdir().expect("run root");
+    let handoff = run_root
+        .path()
+        .join(format!("complete-umbrella-leaf-{LEAF}"));
+    fs::create_dir(&handoff).expect("leaf handoff root");
+    fs::write(handoff.join("design-brief.md"), "durable work\n").expect("durable handoff");
+    let store = RunPointerStore::at(pointer_root.path());
+    let record = store
+        .create(run_pointer(run_root.path(), 123))
+        .expect("create run pointer");
+    let rebound = store.rebind(&record, 456).expect("rebind run pointer");
+    let decision = decide_resume_recovery(&rebound.state, None, Some(ResumeLeafState::Active));
+    assert_eq!(decision.action, ResumeAction::Reselect);
+    assert!(decision.reset_active_leaf);
+    assert_eq!(
+        rebound
+            .state
+            .tmpdir
+            .join(format!("complete-umbrella-leaf-{LEAF}")),
+        fs::canonicalize(handoff).expect("canonical handoff root")
+    );
+}
+
 #[derive(Default)]
 struct FakeRunLeavesOperations {
     graphs: VecDeque<Result<GraphState, String>>,
@@ -330,6 +529,8 @@ struct FakeRunLeavesOperations {
     child_leaves: Vec<u64>,
     resets: Vec<u64>,
     results: Vec<RunLeavesEnvelope>,
+    pointer_leaf: Option<u64>,
+    pointer_transient_attempt_count: u8,
 }
 
 impl RunLeavesOperations for FakeRunLeavesOperations {
@@ -366,8 +567,25 @@ impl RunLeavesOperations for FakeRunLeavesOperations {
     }
 
     fn write_result(&mut self, envelope: &RunLeavesEnvelope) -> Result<(), String> {
+        if let RunLeavesEnvelope::Progress {
+            leaf,
+            transient_attempt_count,
+            ..
+        } = envelope
+        {
+            self.pointer_leaf = Some(*leaf);
+            self.pointer_transient_attempt_count = *transient_attempt_count;
+        }
         self.results.push(envelope.clone());
         self.result_writes.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn transient_attempt_count(&self, leaf: u64) -> u8 {
+        if self.pointer_leaf == Some(leaf) {
+            self.pointer_transient_attempt_count
+        } else {
+            0
+        }
     }
 }
 
@@ -450,21 +668,25 @@ fn run_leaves_verifies_and_selects_from_one_fresh_graph_per_iteration() {
                 action: "launch",
                 leaf: LEAF,
                 completed: 0,
+                transient_attempt_count: 0,
             },
             RunLeavesEnvelope::Progress {
                 action: "verify",
                 leaf: LEAF,
                 completed: 0,
+                transient_attempt_count: 0,
             },
             RunLeavesEnvelope::Progress {
                 action: "launch",
                 leaf: GAP,
                 completed: 1,
+                transient_attempt_count: 0,
             },
             RunLeavesEnvelope::Progress {
                 action: "verify",
                 leaf: GAP,
                 completed: 1,
+                transient_attempt_count: 0,
             },
             RunLeavesEnvelope::Audit { completed: 2 },
         ]
@@ -703,17 +925,30 @@ fn run_leaves_envelopes_and_child_results_are_exact() {
         "FAILED_LEAF=41\nFAILED_STEP=run-child\nFAILURE_REASON=first second\nNEXT_ACTION=failed\n"
     );
 
-    let complete =
-        format!("CHILD_STATUS=complete\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=true\n");
+    let complete = format!(
+        "CHILD_STATUS=complete\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=true\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
+    );
     assert_eq!(
-        classify_child_attempt(LEAF, Ok(()), Ok(complete)),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok(complete)),
         ChildAttempt::Complete
     );
-    let transient = format!(
-        "CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_FAILURE_CLASS={COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API}\n"
+    let stale_attempt = format!(
+        "CHILD_STATUS=complete\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=true\nCHILD_TRANSIENT_ATTEMPT_COUNT=1\n"
     );
     assert_eq!(
-        classify_child_attempt(LEAF, Err("temporary API failure".to_owned()), Ok(transient),),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok(stale_attempt)),
+        ChildAttempt::Failed("child result carries another transient-attempt identity".to_owned())
+    );
+    let transient = format!(
+        "CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\nCHILD_FAILURE_CLASS={COMPLETE_UMBRELLA_CHILD_FAILURE_TRANSIENT_API}\n"
+    );
+    assert_eq!(
+        classify_child_attempt(
+            LEAF,
+            0,
+            Err("temporary API failure".to_owned()),
+            Ok(transient),
+        ),
         ChildAttempt::TransientApi("temporary API failure".to_owned())
     );
 
@@ -722,6 +957,7 @@ fn run_leaves_envelopes_and_child_results_are_exact() {
             action: "verify",
             leaf: LEAF,
             completed: 2,
+            transient_attempt_count: 0,
         }
         .render()
         .expect("progress envelope"),
@@ -744,23 +980,25 @@ fn run_leaves_envelopes_and_child_results_are_exact() {
 #[test]
 fn run_leaves_classifies_malformed_and_nonterminal_child_results() {
     let needs_design = format!(
-        "CHILD_STATUS=needs-design\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_FAILURE_CLASS={COMPLETE_UMBRELLA_CHILD_FAILURE_NEEDS_DESIGN}\n"
+        "CHILD_STATUS=needs-design\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\nCHILD_FAILURE_CLASS={COMPLETE_UMBRELLA_CHILD_FAILURE_NEEDS_DESIGN}\n"
     );
     assert_eq!(
-        classify_child_attempt(LEAF, Ok(()), Ok(needs_design)),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok(needs_design)),
         ChildAttempt::NeedsDesign
     );
 
     for attempt in [
-        classify_child_attempt(LEAF, Ok(()), Err("missing".to_owned())),
+        classify_child_attempt(LEAF, 0, Ok(()), Err("missing".to_owned())),
         classify_child_attempt(
             LEAF,
+            0,
             Err("process failed".to_owned()),
             Err("missing".to_owned()),
         ),
-        classify_child_attempt(LEAF, Ok(()), Ok("not-an-environment".to_owned())),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok("not-an-environment".to_owned())),
         classify_child_attempt(
             LEAF,
+            0,
             Err("process failed".to_owned()),
             Ok("not-an-environment".to_owned()),
         ),
@@ -768,29 +1006,39 @@ fn run_leaves_classifies_malformed_and_nonterminal_child_results() {
         assert!(matches!(attempt, ChildAttempt::Failed(_)));
     }
 
-    let wrong_leaf =
-        format!("CHILD_STATUS=complete\nCHILD_ISSUE={GAP}\nCHILD_ENVELOPE_COMPLETE=true\n");
+    let wrong_leaf = format!(
+        "CHILD_STATUS=complete\nCHILD_ISSUE={GAP}\nCHILD_ENVELOPE_COMPLETE=true\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
+    );
     assert_eq!(
-        classify_child_attempt(LEAF, Ok(()), Ok(wrong_leaf)),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok(wrong_leaf)),
         ChildAttempt::Failed("child result carries another leaf identity".to_owned())
     );
-    let hard_failure =
-        format!("CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\n");
+    let hard_failure = format!(
+        "CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
+    );
     assert_eq!(
-        classify_child_attempt(LEAF, Err("permanent failure".to_owned()), Ok(hard_failure),),
+        classify_child_attempt(
+            LEAF,
+            0,
+            Err("permanent failure".to_owned()),
+            Ok(hard_failure),
+        ),
         ChildAttempt::Failed("permanent failure".to_owned())
     );
-    let invalid_success =
-        format!("CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\n");
+    let invalid_success = format!(
+        "CHILD_STATUS=failed\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=false\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
+    );
     assert!(matches!(
-        classify_child_attempt(LEAF, Ok(()), Ok(invalid_success)),
+        classify_child_attempt(LEAF, 0, Ok(()), Ok(invalid_success)),
         ChildAttempt::Failed(reason) if reason.contains("invalid success shape")
     ));
-    let invalid_failure =
-        format!("CHILD_STATUS=complete\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=true\n");
+    let invalid_failure = format!(
+        "CHILD_STATUS=complete\nCHILD_ISSUE={LEAF}\nCHILD_ENVELOPE_COMPLETE=true\nCHILD_TRANSIENT_ATTEMPT_COUNT=0\n"
+    );
     assert!(matches!(
         classify_child_attempt(
             LEAF,
+            0,
             Err("process failed".to_owned()),
             Ok(invalid_failure),
         ),
@@ -814,7 +1062,21 @@ fn live_run_leaves_confines_state_and_writes_caller_owned_files() {
         result_env: output_root.path().join("run-leaves.env"),
         operator_invoked: true,
     };
-    let mut operations = LiveRunLeavesOperations::new(&arguments).expect("live operations");
+    let pointer_root = tempfile::tempdir().expect("pointer root");
+    let pointer_store = RunPointerStore::at(pointer_root.path());
+    pointer_store
+        .create(CompleteUmbrellaRunPointer {
+            current_step: RunPointerStep::Select,
+            ..CompleteUmbrellaRunPointer::initial(
+                String::from("o/r"),
+                UMBRELLA,
+                fs::canonicalize(output_root.path()).expect("canonical output root"),
+                123,
+            )
+        })
+        .expect("run pointer");
+    let mut operations = LiveRunLeavesOperations::new_with_store(&arguments, pointer_store.clone())
+        .expect("live operations");
     let child = operations.child_arguments(LEAF);
     assert_eq!(child.umbrella, UMBRELLA);
     assert_eq!(child.leaf, LEAF);
@@ -832,6 +1094,7 @@ fn live_run_leaves_confines_state_and_writes_caller_owned_files() {
             action: "launch",
             leaf: LEAF,
             completed: 0,
+            transient_attempt_count: 0,
         })
         .expect("caller-owned result");
     assert_eq!(
@@ -852,7 +1115,7 @@ fn live_run_leaves_confines_state_and_writes_caller_owned_files() {
         result_env: same_file,
         ..arguments
     };
-    let Err(error) = LiveRunLeavesOperations::new(&same_arguments) else {
+    let Err(error) = LiveRunLeavesOperations::new_with_store(&same_arguments, pointer_store) else {
         panic!("identical caller-owned outputs must fail");
     };
     assert!(error.contains("must be different files"));
