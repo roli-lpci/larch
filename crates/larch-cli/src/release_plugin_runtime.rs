@@ -445,7 +445,6 @@ mod tests {
         assert!(paths.contains("ARCHITECTURE.md"));
         assert!(paths.contains("SECURITY.md"));
         assert!(paths.contains("docs/git-operation-inventory.md"));
-        assert!(paths.contains("docs/complete-umbrella-recovery.md"));
         assert!(paths.contains("docs/github-service-inventory.md"));
         assert!(paths.contains("docs/google-service-inventory.md"));
         assert!(paths.contains("docs/dev-hook-audit.md"));
@@ -466,6 +465,16 @@ mod tests {
         for path in DEV_ONLY_PYTHON {
             assert!(!paths.contains(*path));
         }
+    }
+
+    #[test]
+    fn includes_complete_umbrella_recovery_runbook_in_runtime_projection() {
+        let fixture = fixture();
+        let root = repository_root(fixture.path());
+
+        let paths = runtime_paths(&root).expect("runtime path selection");
+
+        assert!(paths.contains("docs/complete-umbrella-recovery.md"));
     }
 
     #[test]

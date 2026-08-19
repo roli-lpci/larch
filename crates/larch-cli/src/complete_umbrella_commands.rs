@@ -1356,10 +1356,11 @@ fn read_durable_child_result(
     let path = tmpdir
         .join("complete-umbrella-run-leaves")
         .join(format!("child-{leaf}.env"));
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not inspect durable child result: {error}")),
-        Ok(_) => {}
+    if let Err(error) = fs::symlink_metadata(&path) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!("could not inspect durable child result: {error}"));
     }
     let root = temporary_root(tmpdir, "run pointer tmpdir")?;
     let text = read_expected_file(&path, tmpdir, &root, "durable child result", 64 * 1024)?;
